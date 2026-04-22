@@ -4,28 +4,76 @@
 
 We estimate variance components for a **Social Genetic Effects (SGE)** model applied to school peer effects. For observed individual $i$ in school class (group) $g_i$:
 
-$$y_i = \mathbf{x}_i'\boldsymbol{\beta} + a_{d,i} + \sum_{j \in g_i,\, j \neq i} a_{s,j} + e_i$$
+$$y_i = \mathbf{x}_i'\boldsymbol{\beta} + a_{d,i} + \sum_{j \in g_i,\, j \neq i} a_{s,j} + \sum_{h=1}^{H} c_{h(i)} + e_i$$
 
 where:
 - $\boldsymbol{\beta}$ are fixed effects (intercept, covariates),
 - $a_{d,i}$ is the **direct** genetic effect of individual $i$ on their own outcome,
 - $a_{s,j}$ is the **indirect (social/peer)** genetic effect of classmate $j$ on $i$'s outcome,
+- $c_{h(i)}$ is the **shared environment effect** of group $h(i)$ for environment factor $h$ (e.g., household), with $c_{h,l} \sim N(0, \sigma^2_{c_h})$,
 - $e_i \sim N(0, \sigma^2_e)$ is the residual.
 
 In matrix notation:
 
-$$\mathbf{y} = X\boldsymbol{\beta} + Z_d \mathbf{a}_d + Z_s \mathbf{a}_s + \mathbf{e}$$
+$$\mathbf{y} = X\boldsymbol{\beta} + Z_d \mathbf{a}_d + Z_s \mathbf{a}_s + \sum_{h=1}^{H} Z_h \mathbf{c}_h + \mathbf{e}$$
 
-where $Z_d$ maps observations to pedigree IDs (identity-like, $n \times N$), and $Z_s$ maps each observation to the sum of classmates' social effects (peer design matrix, $n \times N$). The genetic effects follow:
+where $Z_h$ is the $n \times n_h$ indicator matrix mapping observations to environment-group levels. The $H$ environment factors are optional: setting $H=0$ gives the base SGE model. The total number of variance components is $n_p = 4 + H$.
 
 $$\begin{pmatrix} \mathbf{a}_d \\ \mathbf{a}_s \end{pmatrix} \sim N\!\left(\mathbf{0},\; G \otimes A\right), \quad G = \begin{pmatrix} \sigma^2_d & \sigma_{ds} \\ \sigma_{ds} & \sigma^2_s \end{pmatrix}$$
 
-where $A$ is the $N \times N$ additive genetic relationship matrix derived from the pedigree, and $\otimes$ denotes the Kronecker product. The four variance components to estimate are $\boldsymbol{\theta} = (\sigma^2_d, \sigma^2_s, \sigma_{ds}, \sigma^2_e)$.
+where $Z_d$ maps observations to pedigree IDs (identity-like, $n \times N$), $Z_s$ maps each observation to the sum of classmates' social effects (peer design matrix, $n \times N$), and each $Z_h$ maps observations to environment-group indicators. The genetic effects follow the distribution above, where $A$ is the $N \times N$ additive genetic relationship matrix derived from the pedigree, and $\otimes$ denotes the Kronecker product. The variance components to estimate are $\boldsymbol{\theta} = (\sigma^2_d, \sigma^2_s, \sigma_{ds}, \sigma^2_e, \sigma^2_{c_1}, \ldots, \sigma^2_{c_H})$, giving $n_p = 4 + H$ free parameters.
+
+The solution vector in the MME has dimension $\dim = n_f + 2N + \sum_h n_h$, where $n_h$ is the number of distinct levels of environment factor $h$.
 
 **Key dimensions for the real data:**
 - $N \approx 7{,}000{,}000$ (pedigree size)
 - $n \approx 1{,}000{,}000$ (observed individuals)
-- $\dim(\text{MME}) = n_f + 2N \approx 14{,}000{,}002$
+- $\dim(\text{MME}) = n_f + 2N + \sum_h n_h \approx 14{,}000{,}000 + \sum_h n_h$ (the env term adds one dimension per distinct level per factor)
+
+### 1.1 Missing outcome data (observed-data formulation)
+
+The implementation uses an **observed-data REML formulation**:
+- $n$ is the number of individuals with observed outcome values used in $\mathbf{y}$ and $X$.
+- $N$ is the full pedigree size used for the random-effect vectors $(\mathbf{a}_d, \mathbf{a}_s)$ and for $A^{-1}$.
+
+Individuals with missing outcomes are therefore not included as rows in $\mathbf{y}$ (no residual term for that individual), but they can still be part of the pedigree graph through $A^{-1}$. This means their direct and social genetic effects remain in the model state and are estimated as BLUPs, borrowing information from related observed individuals.
+
+Operationally, the contribution of an unobserved pedigree ID depends on available design information:
+- If an ID is present only in the pedigree, it contributes through genetic covariance structure and is shrunk toward the pedigree prior.
+- If an ID is also represented in the group/design mapping used to build the social operator, it can additionally contribute through peer-structure equations even without its own outcome row.
+
+In the current `run_emai.jl` workflow, group/design mappings are built from the observed table (`yX.csv`). To activate the second case for missing-outcome individuals, the input pipeline must provide group membership independently of observed outcomes.
+
+This separation is exactly why we distinguish $n$ (observed outcomes) from $N$ (all pedigree IDs): missing outcomes are integrated out at the observation level while still allowing genetic information propagation to unobserved individuals.
+
+### 1.2 Required input data and effect scope
+
+The model requires two linked data layers: an observed-data layer (length $n$) and a pedigree layer (size $N$).
+
+Required inputs in the current workflow are:
+
+| Input | Dimension | Role |
+|---|---|---|
+| Outcome vector ($\mathbf{y}$) | $n$ | Observed response values |
+| Fixed-effect design ($X$) | $n \times n_f$ | Covariates and intercept |
+| Observation-to-pedigree IDs (`id_ped`) | $n$ | Maps each observed row to a pedigree ID in $1..N$ |
+| Peer-group IDs (`group`) | $n$ | Defines social exposure structure among observed rows |
+| Sparse $A^{-1}$ triplets | on $N \times N$ | Pedigree precision structure |
+| Sparse Cholesky of $A^{-1}$ | on $N \times N$ | Enables implicit application of $A$ |
+| Optional environment IDs (`env_ids[h]`) | $n$ each | Observation-level grouping for each shared environment factor |
+
+This implies different scope for different random effects:
+
+1. **Direct and indirect genetic effects** $(\mathbf{a}_d, \mathbf{a}_s)$ are defined on the full pedigree size $N$.
+2. **Shared environment effects** $\mathbf{c}_h$ are defined through `env_ids[h]` of length $n$ (observed rows), with one effect per observed environment level $1..n_h$.
+
+So yes: in the current formulation, genetic effects are pedigree-wide, while environment effects are observation/group-level by construction.
+
+Practically, this means:
+
+1. Unobserved pedigree members can still receive BLUPs for $a_d$ and $a_s$ through pedigree covariance.
+2. Environment effects are estimated for levels represented in the supplied `env_ids` mapping.
+3. Expanding environment effects beyond observed rows would require an expanded input mapping design, not only a larger pedigree.
 
 ## 2. Mixed Model Equations (MME)
 
@@ -35,9 +83,28 @@ $$\underbrace{\begin{pmatrix} X'X & X'Z_d & X'Z_s \\ Z_d'X & Z_d'Z_d + \lambda_{
 
 where $\Lambda = G^{-1}\sigma^2_e$ provides the ratios $\lambda_{dd}, \lambda_{ds}, \lambda_{ss}$.
 
-The coefficient matrix $C$ is of dimension $\sim 14M \times 14M$ and is never formed explicitly. Instead, we implement it as a **matrix-free operator** that computes $C \cdot v$ for any vector $v$ via component-wise operations.
+The coefficient matrix $C$ is of dimension $(n_f + 2N + \sum_h n_h) \times (n_f + 2N + \sum_h n_h)$ — roughly $\gtrsim 14M$ with env effects included — and is never formed explicitly. Instead, we implement it as a **matrix-free operator** that computes $C \cdot v$ for any vector $v$ via component-wise operations.
 
-## 3. Estimation: Average Information REML (AI-REML)
+## 3. Why Not Direct Likelihood Optimisation?
+
+A natural starting point for estimating $\boldsymbol{\theta}$ is to maximise the **marginal (restricted) log-likelihood** directly:
+
+$$\ell_R(\boldsymbol{\theta}) = -\frac{1}{2}\left[\log|V| + \log|X'V^{-1}X| + \mathbf{y}'P\mathbf{y}\right]$$
+
+where $V = Z_d A Z_d' \sigma^2_d + Z_s A Z_s' \sigma^2_s + \cdots + I\sigma^2_e$ is the $n \times n$ marginal covariance matrix. A derivative-free optimiser (Nelder–Mead, Brent, etc.) could then call this function repeatedly until convergence.
+
+The fundamental obstacle is the **log-determinant** $\log|V|$. For $n \approx 400{,}000$, forming $V$ explicitly already requires $\sim 1.2$ TB of memory. Even if $V$ were sparse, computing its log-determinant exactly requires a Cholesky factorisation, whose fill-in for a pedigree-structured matrix is enormous. The second term $\log|X'V^{-1}X|$ requires computing $V^{-1}X$, which is equally infeasible.
+
+**AI-REML avoids all log-determinants.** The score vector and Average Information matrix (Sections 3.1–3.3) are expressed entirely in terms of $P\mathbf{y}$ and $P\mathbf{z}_j$ — vectors obtained by solving the MME. The log-likelihood value itself is never evaluated. Convergence is instead monitored through the score norm $\|\mathbf{s}\|$ and the relative parameter change $\|\Delta\boldsymbol{\theta}\|/\|\boldsymbol{\theta}\|$.
+
+This means:
+- **No determinants** are computed at any point in the algorithm.
+- **No dense $n \times n$ matrices** are ever formed or stored.
+- The cost per iteration is dominated by $k+5$ CG solves of the $(n_f + 2N + \sum_h n_h)$-dimensional MME, each of which is feasible via the matrix-free PCG approach (Section 5).
+
+The trade-off relative to derivative-free optimisation is that AI-REML requires analytically correct score and curvature expressions, and is a Newton-type method that can diverge if the initial variance components are far from the optimum. The step-halving safeguard (Section 3.4) mitigates the latter.
+
+## 4. Estimation: Average Information REML (AI-REML)
 
 We use AI-REML (Gilmour, Thompson & Cullis, 1995) to estimate $\boldsymbol{\theta}$. The update at iteration $t$ is:
 
@@ -54,12 +121,16 @@ $$s_i = \frac{1}{2}\left(\mathbf{y}'P V_i P\mathbf{y} - \text{tr}(P V_i)\right)$
 where $P = V^{-1} - V^{-1}X(X'V^{-1}X)^{-1}X'V^{-1}$ is the projection matrix. In practice, $P\mathbf{y}$ is obtained from the MME solution (see Section 4).
 
 The variance derivatives are:
+
 | Parameter | $V_i$ |
 |---|---|
 | $\sigma^2_d$ | $Z_d A Z_d'$ |
 | $\sigma^2_s$ | $Z_s A Z_s'$ |
 | $\sigma_{ds}$ | $Z_d A Z_s' + Z_s A Z_d'$ |
 | $\sigma^2_e$ | $I_n$ |
+| $\sigma^2_{c_h}$ | $Z_h Z_h'$ |
+
+The $Z_h Z_h'$ application is a **scatter-gather** operation: for output $i$, $(Z_h Z_h' u)_i = \sum_{j:\, h(j)=h(i)} u_j$. This is $O(n)$ and requires no matrix storage.
 
 ### 3.2 Stochastic trace estimation (Hutchinson)
 
@@ -83,9 +154,9 @@ A step-halving safeguard ensures:
 
 The step size $\alpha$ starts at the requested damping value and is halved up to 20 times until both conditions are satisfied.
 
-## 4. Solving the MME: Conjugate Gradient with Matrix-Free Operator
+## 5. Solving the MME: Conjugate Gradient with Matrix-Free Operator
 
-The core computational task is solving systems of the form $C \mathbf{x} = \mathbf{b}$ where $C$ is the $\sim 14M \times 14M$ MME coefficient matrix. We use the **Preconditioned Conjugate Gradient (PCG)** algorithm.
+The core computational task is solving systems of the form $C \mathbf{x} = \mathbf{b}$ where $C$ is the $(n_f + 2N + \sum_h n_h) \times (n_f + 2N + \sum_h n_h)$ MME coefficient matrix. We use the **Preconditioned Conjugate Gradient (PCG)** algorithm.
 
 ### 4.1 Matrix-free operator
 
@@ -130,7 +201,7 @@ Uses only the diagonal of the MME coefficient matrix. Cheaper per CG iteration (
 
 CG solutions are warm-started across REML iterations: the solution from the previous iteration serves as the initial guess for the next. This is particularly effective because parameter changes between successive REML iterations are small, so the MME solution changes slowly.
 
-## 5. Parallelization Strategy
+## 6. Parallelization Strategy
 
 The main parallelizable components are:
 
@@ -149,12 +220,15 @@ The matrix-free MME operator and preconditioner use mutable workspace buffers fo
 - $A$-application temporaries ($\text{tmp}_{N1}$, $\text{tmp}_{N2}$, $\text{tmp}_{N3}$)
 - Preconditioner temporaries ($\text{tmp}_1$, $\text{tmp}_2$)
 - Output buffer ($v_i\_\text{out}$)
+- Environment temporaries ($\text{env\_tmp}[h]$ for each factor $h$)
 
 Threading uses `:static` scheduling to guarantee a stable `threadid()` → workspace mapping throughout each parallel loop.
 
-Read-only data (model matrices $A^{-1}$, $L$, $X$, group structure) is shared safely across all threads.
+**Implementation note:** In Julia 1.12, multiple consecutive `Threads.@threads :static` blocks within a single function corrupt each other's closure environments, producing non-deterministic wrong results. Each `@threads` block must therefore be wrapped in its own dedicated function. The five helpers are: `_threaded_vi_py!`, `_threaded_trace!`, `_threaded_ai_cg!`, `_threaded_ai_matvec!`, `_threaded_z_solves!`.
 
-## 6. Memory Layout
+Read-only data (model matrices $A^{-1}$, $L$, $X$, group structure, environment ID arrays) is shared safely across all threads.
+
+## 7. Memory Layout
 
 For $N = 7{,}000{,}000$ and $n = 1{,}000{,}000$:
 
@@ -168,7 +242,7 @@ For $N = 7{,}000{,}000$ and $n = 1{,}000{,}000$:
 | $X$ (dense, $n \times n_f$) | $\sim 16$ MB ($n_f = 2$) |
 | **Total estimate** | **$\sim 10\text{--}15$ GB** |
 
-## 7. Convergence Monitoring
+## 8. Convergence Monitoring
 
 Each REML iteration reports:
 - **Wall-clock timing** per step (CG(y), CG(z), AI) and cumulative time
@@ -181,7 +255,7 @@ Each REML iteration reports:
 
 All diagnostics are also written to a CSV log file for external monitoring during long runs.
 
-## 8. Post-Estimation
+## 9. Post-Estimation
 
 After convergence, a final MME solve with the converged variance components yields:
 - **BLUE** $\hat{\boldsymbol{\beta}}$ (fixed effects estimates)
@@ -191,7 +265,7 @@ Results are stored in an `AiRemlResult` struct and serialized to disk via JLD2.
 
 Standard errors for the variance components are obtained from the inverse of the (regularized) AI matrix. Significance testing for individual parameters (e.g., $H_0: \sigma^2_s = 0$) can be performed via a Wald-type $z$-test: $z = \hat{\theta}_i / \text{SE}_i$.
 
-## 9. Software
+## 10. Software
 
 - **Julia 1.12** with `IterativeSolvers.jl` (PCG solver), `SparseArrays`, `JLD2`
 - **R** for pedigree processing: computing $A^{-1}$ (Henderson's rules) and its Cholesky factor $L$, exported as sparse triplet CSV files

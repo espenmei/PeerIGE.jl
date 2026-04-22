@@ -831,9 +831,10 @@ function load_emai_direct_model(; yx_path::String="yX.csv",
     Ainv_path::String="Ainv_triplet.csv", L_Ainv_path::String="LAinv_triplet.csv",
     σ2_d::Float64=1.0, σ2_e::Float64=2.0)
     yX = DataFrame(CSV.File(yx_path))
-    n = nrow(yX)
-    X = hcat(ones(n), yX[:, :x])
-    y = Vector{Float64}(yX[:, :y])
+    obs_mask = .!ismissing.(yX[:, :y])
+    n = count(obs_mask)
+    X = hcat(ones(n), Float64.(yX[obs_mask, :x]))
+    y = Float64.(yX[obs_mask, :y])
 
     Ainv_df = DataFrame(CSV.File(Ainv_path))
     i_vals = Ainv_df[:, "i"]
@@ -851,7 +852,7 @@ function load_emai_direct_model(; yx_path::String="yX.csv",
     L_Ainv = sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"]))
     L_Ainv = LowerTriangular(L_Ainv)
 
-    obs_to_id = Vector{Int}(yX[:, :id_ped])
+    obs_to_id = Int.(yX[obs_mask, :id_ped])
     return DirectModel(y, X, Ainv, L_Ainv, obs_to_id, σ2_d, σ2_e)
 end
 

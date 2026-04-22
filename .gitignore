@@ -11,3 +11,7 @@ Manifest.toml
 
 # HTML output
 *.html
+
+# Generated folders
+outputs/
+docs/computational_approach_files/

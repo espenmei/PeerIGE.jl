@@ -52,17 +52,20 @@ Parameters worth tuning carefully:
 
 - `G = [σ2_d σ_ds; σ_ds σ2_s]` must remain positive definite
 - `σ2_d`, `σ2_s`, and `σ2_e` must stay positive
+- `σ2_env[h]` must stay positive for each env factor `h`
 - Threaded paths must use thread-local mutable buffers only
 - `A` must never be formed explicitly; apply it through sparse triangular solves
 - Numerical guards like `max(..., 1e-6)` and step-halving are deliberate stability controls
+- **Each `Threads.@threads :static` block must live in its own dedicated helper function.** Multiple consecutive `@threads` blocks within a single function corrupt each other's closure environments in Julia 1.12 (non-deterministic results). The helpers are: `_threaded_vi_py!`, `_threaded_trace!`, `_threaded_ai_cg!`, `_threaded_ai_matvec!`, `_threaded_z_solves!`.
 
 ## High-Risk Areas
 
 - `BlockPreconditioner` and `DiagPreconditioner`
 - `MMEOperator` and its `mul!` overloads
-- `apply_A!`, `get_Vi_u!`, and threaded variants
+- `apply_A!`, `get_Vi_u!`, `get_Vi_env_u!`, and the `_threaded_*` helper functions
 - `compute_score_and_ai`
 - parameter updates in `run_aireml`
+- `env_ids`, `env_n_levels`, `env_counts`, `env_tmp` fields in `SGEModel` and `ThreadWorkspace`
 
 For changes in these sections, define the expected mathematical identity before editing.
 
@@ -71,10 +74,11 @@ For changes in these sections, define the expected mathematical identity before 
 After meaningful code changes, verify at least the following:
 
 1. Julia imports succeed under `--project=.`
-2. Run `julia --project=. test_smoke_emai.jl`
-3. `aireml_log.csv` is produced and contains sensible timing and parameter output
+2. Run `julia --threads 8 --project=. test_smoke_emai.jl` (tests H=0 and H=1 sequentially)
+3. `aireml_log_base.csv` and `aireml_log_env.csv` are produced with sensible timing and parameters
 4. Parameter updates remain finite and the `G` matrix stays valid
 5. Threaded changes do not introduce shared mutable state
+6. For any change touching a `_threaded_*` helper or `compute_score_and_ai`, run `julia --threads 8 --project=. bench_threads.jl` and confirm `Max |Δ| < 1e-4` and speedup > 1.5x
 
 ## Suggested Task Shapes For AI Collaboration
 

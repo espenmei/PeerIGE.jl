@@ -15,7 +15,7 @@ set.seed(080318)
 # OPTIMISED: All linear algebra is done on the small (4x4 / 8x8) block level.
 # The block-diagonal structure of A (identical Astruc blocks) means we never
 # need to form or factorise million-scale matrices.
-#setwd("C:/Users/espenmei/development/PeerIGE.jl")
+#setwd("C:/Users/espenmei/OneDrive - Universitetet i Oslo/Prosjekter/schoolpeer_effect/peer_ige_Julia/emai")
 
 library(Matrix)
 library(tidyverse)
@@ -142,8 +142,16 @@ write_csv(Ainv_triplet,  "Ainv_triplet.csv")
 write_csv(LAinv_triplet, "LAinv_triplet.csv")
 
 # --- 4. Output data ---
+# Master table: all individuals as rows; ~10% have missing y to simulate
+# group members without observed outcomes.
 datao = data.frame(y = y_obs, x = x2, group = class, id_ped = seq_len(nstudent))
-write_csv(datao, "yX.csv")
+set.seed(42)
+n_missing = round(0.10 * nstudent)
+missing_idx = sample.int(nstudent, n_missing)
+datao$y[missing_idx] = NA_real_
+message(sprintf("Master yX table: %d total rows, %d observed, %d missing",
+                nstudent, nstudent - n_missing, n_missing))
+write_csv(datao, "yX.csv", na = "")
 
 X = model.matrix(~ 1 + x2, data = datao)
 write_csv(as.data.frame(X), "X.csv")

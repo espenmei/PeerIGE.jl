@@ -13,7 +13,7 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 - `yX.csv`, `X.csv`: dense input data
 - `Ainv_triplet.csv`, `LAinv_triplet.csv`: sparse pedigree matrix inputs in triplet format
 - `bench_threads.jl`: threading benchmark (compares sequential vs threaded timing and correctness)
-- `test_smoke_emai.jl`: quick smoke test for H=0 and H=1 models
+- `tests`: test entrypoints and smoke checks for missing-response handling and H=0/H=1 models
 
 ## Folder Structure
 
@@ -21,6 +21,7 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 - `outputs/results`: JLD2 model result files
 - `outputs/benchmarks`: benchmark CSV logs
 - `outputs/smoke`: smoke-test logs
+- `tests`: test scripts and the main test entrypoint (`runtests.jl`)
 - `diagnostics`: one-off diagnostic scripts (`diag_*.jl`)
 - `docs`: rendered HTML documentation artifacts (`computational_approach.html` and assets)
 
@@ -48,10 +49,10 @@ Run the direct-effects baseline with:
 julia --project=. run_emai_direct.jl
 ```
 
-Run a short smoke test after code changes with:
+Run the test entrypoint after code changes with:
 
 ```powershell
-julia --project=. test_smoke_emai.jl
+julia --project=. tests/runtests.jl
 ```
 
 The runner currently:

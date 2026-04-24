@@ -1,4 +1,4 @@
-include("emai.jl")
+include(joinpath(@__DIR__, "..", "emai.jl"))
 
 println("[Smoke test] Running quick SGE model verification...")
 
@@ -35,6 +35,35 @@ try
     gs0b = build_group_structure(yX0, 3, obs0.obs_mask)
     check(2 in gs0b.members_id[gs0b.id_to_group[1]], "Test 0b: missing-outcome member should remain in group")
     println("[Smoke test] Test 0b PASS (observed filtering)")
+
+    # --- TEST 0c: small groups keep missing-outcome peers in the social design ---
+    println("[Smoke test] Test 0c: small-group peer counts with missing outcomes...")
+    yX0c4 = DataFrame(y=Union{Missing,Float64}[1.0, 2.0, 3.0, missing],
+        x=[0.1, 0.2, 0.3, 0.4], group=[10, 10, 10, 10], id_ped=[1, 2, 3, 4])
+    obs0c4 = load_observed_data(yX0c4; covariate_cols=[:x])
+    gs0c4 = build_group_structure(yX0c4, 4, obs0c4.obs_mask)
+    a_s4 = collect(1.0:4.0)
+    for id in obs0c4.obs_to_id
+        members = gs0c4.members_id[gs0c4.id_to_group[id]]
+        check(length(members) == 4, "Test 0c(4): expected full class membership for ID $id")
+        check(length(members) - 1 == 3, "Test 0c(4): expected 3 peers for ID $id")
+        social_sum = sum(a_s4[m] for m in members) - a_s4[id]
+        check(social_sum == sum(setdiff(members, [id])), "Test 0c(4): social sum mismatch for ID $id")
+    end
+
+    yX0c3 = DataFrame(y=Union{Missing,Float64}[1.0, 2.0, missing],
+        x=[0.1, 0.2, 0.3], group=[20, 20, 20], id_ped=[5, 6, 7])
+    obs0c3 = load_observed_data(yX0c3; covariate_cols=[:x])
+    gs0c3 = build_group_structure(yX0c3, 7, obs0c3.obs_mask)
+    a_s3 = collect(1.0:7.0)
+    for id in obs0c3.obs_to_id
+        members = gs0c3.members_id[gs0c3.id_to_group[id]]
+        check(length(members) == 3, "Test 0c(3): expected full class membership for ID $id")
+        check(length(members) - 1 == 2, "Test 0c(3): expected 2 peers for ID $id")
+        social_sum = sum(a_s3[m] for m in members) - a_s3[id]
+        check(social_sum == sum(setdiff(members, [id])), "Test 0c(3): social sum mismatch for ID $id")
+    end
+    println("[Smoke test] Test 0c PASS (small-group peer counts)")
 
     # Load the same inputs as the main runner.
     yX = DataFrame(CSV.File("yX.csv"))

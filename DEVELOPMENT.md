@@ -74,7 +74,7 @@ For changes in these sections, define the expected mathematical identity before 
 After meaningful code changes, verify at least the following:
 
 1. Julia imports succeed under `--project=.`
-2. Run `julia --threads 8 --project=. test_smoke_emai.jl` (tests H=0 and H=1 sequentially)
+2. Run `julia --threads 8 --project=. tests/runtests.jl` (tests missing-response group mapping plus H=0 and H=1 sequentially)
 3. `aireml_log_base.csv` and `aireml_log_env.csv` are produced with sensible timing and parameters
 4. Parameter updates remain finite and the `G` matrix stays valid
 5. Threaded changes do not introduce shared mutable state

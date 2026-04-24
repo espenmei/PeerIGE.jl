@@ -95,11 +95,12 @@ where $V = Z_d A Z_d' \sigma^2_d + Z_s A Z_s' \sigma^2_s + \cdots + I\sigma^2_e$
 
 The fundamental obstacle is the **log-determinant** $\log|V|$. For $n \approx 400{,}000$, forming $V$ explicitly already requires $\sim 1.2$ TB of memory. Even if $V$ were sparse, computing its log-determinant exactly requires a Cholesky factorisation, whose fill-in for a pedigree-structured matrix is enormous. The second term $\log|X'V^{-1}X|$ requires computing $V^{-1}X$, which is equally infeasible.
 
-**AI-REML avoids all log-determinants.** The score vector and Average Information matrix (Sections 3.1–3.3) are expressed entirely in terms of $P\mathbf{y}$ and $P\mathbf{z}_j$ — vectors obtained by solving the MME. The log-likelihood value itself is never evaluated. Convergence is instead monitored through the score norm $\|\mathbf{s}\|$ and the relative parameter change $\|\Delta\boldsymbol{\theta}\|/\|\boldsymbol{\theta}\|$.
+**AI-REML avoids all log-determinants.** The score vector and Average Information matrix (Sections 3.1–3.3) are expressed entirely in terms of $P\mathbf{y}$ and $P\mathbf{z}_j$ — vectors obtained by solving the MME. The log-likelihood value itself is never evaluated. Instead, the algorithm operates as a **gradient-based quasi-Newton method**: the gradient (score vector $\mathbf{s}$) is computed without evaluating the objective, and parameter updates use the Average Information matrix as an approximate Hessian. Convergence is monitored through the score norm $\|\mathbf{s}\|$ and the relative parameter change $\|\Delta\boldsymbol{\theta}\|/\|\boldsymbol{\theta}\|$.
 
 This means:
 - **No determinants** are computed at any point in the algorithm.
 - **No dense $n \times n$ matrices** are ever formed or stored.
+- **The objective is never evaluated**—only its gradient, which is much cheaper and numerically more stable.
 - The cost per iteration is dominated by $k+5$ CG solves of the $(n_f + 2N + \sum_h n_h)$-dimensional MME, each of which is feasible via the matrix-free PCG approach (Section 5).
 
 The trade-off relative to derivative-free optimisation is that AI-REML requires analytically correct score and curvature expressions, and is a Newton-type method that can diverge if the initial variance components are far from the optimum. The step-halving safeguard (Section 3.4) mitigates the latter.
@@ -114,15 +115,17 @@ where $\mathbf{s}$ is the REML score vector and AI is the Average Information ma
 
 ### 3.1 Score vector
 
-For parameter $\theta_i$ with associated variance structure $V_i = \partial V / \partial \theta_i$:
+**Intuition:** The score vector $\mathbf{s}$ is the gradient of the restricted log-likelihood with respect to the variance parameters. Each component $s_i$ tells you the direction and magnitude to move parameter $\theta_i$ to improve the likelihood. When all $s_i \approx 0$, the algorithm has converged.
+
+**Definition:** For parameter $\theta_i$ with associated variance structure $V_i = \partial V / \partial \theta_i$:
 
 $$s_i = \frac{1}{2}\left(\mathbf{y}'P V_i P\mathbf{y} - \text{tr}(P V_i)\right)$$
 
-where $P = V^{-1} - V^{-1}X(X'V^{-1}X)^{-1}X'V^{-1}$ is the projection matrix. In practice, $P\mathbf{y}$ is obtained from the MME solution (see Section 4).
+where $P = V^{-1} - V^{-1}X(X'V^{-1}X)^{-1}X'V^{-1}$ is the projection matrix and $V$ is the $n \times n$ marginal covariance matrix. In practice, $P\mathbf{y}$ is obtained from the MME solution (see Section 4).
 
-The variance derivatives are:
+**Variance derivatives:** The table below lists $V_i = \partial V / \partial \theta_i$ for each variance parameter. These are the partial derivatives of the marginal covariance matrix with respect to each variance component. They appear in both the score computation (above) and the Hutchinson trace estimation (Section 3.2) and Average Information matrix (Section 3.3).
 
-| Parameter | $V_i$ |
+| Parameter | $\partial V / \partial \theta_i$ |
 |---|---|
 | $\sigma^2_d$ | $Z_d A Z_d'$ |
 | $\sigma^2_s$ | $Z_s A Z_s'$ |
@@ -189,7 +192,15 @@ Two preconditioner options are implemented:
 
 $$M^{-1} = \begin{pmatrix} \text{diag}(X'X)^{-1} & 0 \\ 0 & (G \otimes A) / \sigma^2_e \end{pmatrix}$$
 
+The values of $G$ and $\sigma^2_e$ used in the preconditioner are the **current estimates at each AI-REML iteration**. The preconditioner is recomputed before each set of CG solves, so it adapts as variance estimates improve. This typically speeds convergence compared to using fixed initial values.
+
 This captures the full off-diagonal structure of $A^{-1}$ in the genetic block. Each application requires 4 sparse triangular solves (2 for $A \cdot r_d$ and 2 for $A \cdot r_s$), plus a $2 \times 2$ $G$-matrix blend.
+
+**Environmental effect blocks** (when present): For each environment factor $h$, a diagonal preconditioner is used at each level $j$:
+
+$$M_h^{-1}(j) = \frac{1}{n_{h,j} + \frac{\sigma^2_e}{\sigma^2_{c_h}}}$$
+
+where $n_{h,j}$ is the number of observations at level $j$ of factor $h$, $\sigma^2_e$ is the current residual variance, and $\sigma^2_{c_h}$ is the current environmental variance component for factor $h$. Like the genetic block, both $\sigma^2_e$ and $\sigma^2_{c_h}$ use current iteration estimates.
 
 **Diagonal Preconditioner** (lighter alternative):
 

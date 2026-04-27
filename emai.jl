@@ -88,6 +88,7 @@ struct GroupStructure
     members_id::Vector{Vector{Int}} # ID-er i stamtavlen (1..N)
     obs_to_id::Vector{Int}          # Hvilken stamtavle-ID har obs i? (1..n)
     id_to_group::Vector{Int}        # Hvilken gruppe tilhører stamtavle-ID i?
+    obs_to_group::Vector{Int}       # Precomputed: hvilken gruppe tilhører obs i? (1..num_groups)
 end
 
 function GroupStructure(group_ids::Vector{Int}, animal_ids::Vector{Int}, N_pedigree::Int;
@@ -133,7 +134,9 @@ function GroupStructure(group_ids::Vector{Int}, animal_ids::Vector{Int}, N_pedig
         @assert id_to_group[id] != 0 "Observed pedigree ID $id has no group assignment"
     end
 
-    return GroupStructure(members, animal_ids, id_to_group)
+    obs_to_group = [id_to_group[id] for id in animal_ids]
+
+    return GroupStructure(members, animal_ids, id_to_group, obs_to_group)
 end
 
 mutable struct SGEModel
@@ -296,12 +299,15 @@ struct ThreadWorkspace
     precond_tmp2::Vector{Float64}  # length N
     # Shared environment workspace (one tmp per factor)
     env_tmp::Vector{Vector{Float64}}  # H vectors, each length n_h
+    # Group-sum buffer (length num_groups) — used to cache Σ v[bid] per group
+    group_sum::Vector{Float64}
 end
 
 function create_thread_workspaces(model::SGEModel, nt::Int)
     n = length(model.y)
     N = size(model.Ainv, 1)
     dim = get_dim(model)
+    ng = length(model.groups.members_id)
     return [ThreadWorkspace(
         zeros(dim),
         zeros(n), zeros(n), zeros(dim),
@@ -309,7 +315,8 @@ function create_thread_workspaces(model::SGEModel, nt::Int)
         zeros(N), zeros(N), zeros(N),
         zeros(n),
         zeros(N), zeros(N),
-        [zeros(n_h) for n_h in model.env_n_levels]
+        [zeros(n_h) for n_h in model.env_n_levels],
+        zeros(ng)
     ) for _ in 1:nt]
 end
 
@@ -317,6 +324,7 @@ end
 function model_workspace(model::SGEModel)
     n = length(model.y)
     N = size(model.Ainv, 1)
+    ng = length(model.groups.members_id)
     return ThreadWorkspace(
         model.rhs_buffer,
         model.op_wn, model.op_wn2, model.op_wdim,
@@ -324,7 +332,8 @@ function model_workspace(model::SGEModel)
         model.tmp_N1, model.tmp_N2, model.tmp_N3,
         zeros(n),       # vi_out
         zeros(N), zeros(N),  # precond_tmp1, precond_tmp2
-        [zeros(n_h) for n_h in model.env_n_levels]
+        [zeros(n_h) for n_h in model.env_n_levels],
+        zeros(ng)
     )
 end
 
@@ -337,6 +346,7 @@ struct MMEOperator{T}
     Ad::Vector{T}             # Ainv * v_d buffer (length N)
     As::Vector{T}             # Ainv * v_s buffer (length N)
     Ginv_scaled::Matrix{T}    # Ginv * σ²_e, cached (2×2)
+    group_sum::Vector{T}      # length num_groups (workspace alias)
 end
 
 function make_mme_operator(model::SGEModel, ws::ThreadWorkspace)
@@ -349,7 +359,7 @@ function make_mme_operator(model::SGEModel, ws::ThreadWorkspace)
     λ[2, 1] = λ[1, 2]
     λ[2, 2] = model.σ2_d * inv_det
     return MMEOperator{Float64}(model, ws.op_wn, ws.op_wn2, ws.op_wdim,
-        ws.op_Ad, ws.op_As, λ)
+        ws.op_Ad, ws.op_As, λ, ws.group_sum)
 end
 
 # Disse to funksjonene er nødvendige for at IterativeSolvers skal fungere
@@ -367,7 +377,7 @@ function mul!(y, op::MMEOperator, x, α, β)
     @. y = α * op.workspace_dim + β * y
 end
 
-function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::Vector{Float64}, sol_vector::Vector{Float64})
+function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::Vector{Float64}, sol_vector::Vector{Float64}, ws::ThreadWorkspace)
     n = length(model.y)
     N = size(model.Ainv, 1)
     nf = size(model.X, 2)
@@ -382,15 +392,13 @@ function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::V
 
     # 2. Beregn y_hat in-place i out, deretter Px
     mul!(out, model.X, beta)
+    # Cache group_sum for a_s så vi unngår å summere medlemmer per obs
+    compute_group_sums!(ws.group_sum, a_s, gs.members_id)
     @inbounds for i in 1:n
         target_id = gs.obs_to_id[i]
         out[i] += a_d[target_id]
-        g_idx = gs.id_to_group[target_id]
-        s = 0.0
-        for bid in gs.members_id[g_idx]
-            s += a_s[bid]
-        end
-        out[i] += s - a_s[target_id]  # branchless
+        g_idx = gs.obs_to_group[i]
+        out[i] += ws.group_sum[g_idx] - a_s[target_id]  # peer sum (excl. self)
     end
 
     # + env contributions: Zh * ch
@@ -413,16 +421,46 @@ function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::V
     return out
 end
 
-# BEREGNER: Zs' * u (Brukes for bidrag fra faste effekter og direkte genetikk)
-function apply_Zs_transpose!(v_N, u_n, gs::GroupStructure)
-    @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
-        val = u_n[i]
-        g_idx = gs.id_to_group[target_id]
-        for bid in gs.members_id[g_idx]
-            v_N[bid] += val
+# Beregner: group_sum[g] = Σ_{bid ∈ members_g} v_N[bid]
+@inline function compute_group_sums!(group_sum::Vector{Float64}, v_N::AbstractVector{Float64},
+    members_id::Vector{Vector{Int}})
+    @inbounds for g in eachindex(members_id)
+        s = 0.0
+        for bid in members_id[g]
+            s += v_N[bid]
         end
-        v_N[target_id] -= val  # Fjern selv-bidraget (branchless)
+        group_sum[g] = s
     end
+    return group_sum
+end
+
+# BEREGNER: Zs' * u (Brukes for bidrag fra faste effekter og direkte genetikk)
+#   Zs[i, bid] = 1 hvis bid ∈ group(i) og bid ≠ obs_to_id[i], else 0
+#   => (Zs' * u)[bid] = Σ_{i: bid ∈ group(i), bid ≠ self_i} u[i]
+#                     = Σ_{i: group(i) = g(bid)} u[i]  -  u[i_self if obs_to_id[i]=bid]
+# Implementasjon: først akkumuler obs_sum[g] = Σ u[i] per gruppe (O(n)),
+# deretter spre obs_sum til alle medlemmer av g (O(Σ m_g)),
+# og trekk fra self-bidraget per obs (O(n)).
+function apply_Zs_transpose!(v_N, u_n, gs::GroupStructure, group_sum::Vector{Float64})
+    # Steg 1: obs_sum[g] = Σ_{i: g(i)=g} u_n[i]
+    fill!(group_sum, 0.0)
+    @inbounds for i in eachindex(u_n)
+        group_sum[gs.obs_to_group[i]] += u_n[i]
+    end
+    # Steg 2: spre obs_sum til alle medlemmer
+    @inbounds for g in eachindex(gs.members_id)
+        s = group_sum[g]
+        if s != 0.0
+            for bid in gs.members_id[g]
+                v_N[bid] += s
+            end
+        end
+    end
+    # Steg 3: trekk fra self-bidrag
+    @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
+        v_N[target_id] -= u_n[i]
+    end
+    return v_N
 end
 
 # BEREGNER: Zs' * Zs * v_s (Den optimaliserte snarveien for sosiale effekter)
@@ -494,20 +532,17 @@ function (op::MMEOperator{T})(res, v) where T
 
     # 2. SOSIALE EFFEKTER (res_s)
     # Krydsledd: Zs' * y_hat  (X*v_f + Zd*v_d + sum Zh*v_h) — ingen re-beregning
-    apply_Zs_transpose!(res_s, y_hat, gs)
+    apply_Zs_transpose!(res_s, y_hat, gs, op.group_sum)
     # Ledd: Zs' * Zs * vs
     apply_ZsZs_accumulate!(res_s, v_s, gs)
 
     # 3. Fullfør y_hat: legg til Zs * v_s (gjenbruker workspace_n2)
     tmp_zs = op.workspace_n2
     fill!(tmp_zs, zero(T))
+    # Cache group_sum for v_s
+    compute_group_sums!(op.group_sum, v_s, gs.members_id)
     @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
-        g_idx = gs.id_to_group[target_id]
-        s = zero(T)
-        for bid in gs.members_id[g_idx]
-            s += v_s[bid]
-        end
-        tmp_zs[i] = s - v_s[target_id]  # Branchless: sum alle, trekk fra self
+        tmp_zs[i] = op.group_sum[gs.obs_to_group[i]] - v_s[target_id]
     end
     y_hat .+= tmp_zs
 
@@ -540,14 +575,14 @@ function (op::MMEOperator{T})(res, v) where T
 end
 
 # Bygger MME høyresiden: rhs = [X'*v; Zd'*v; Zs'*v; (Zh'*v for h=1..H)]
-function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGEModel, N::Int, nf::Int)
+function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGEModel, N::Int, nf::Int, ws::ThreadWorkspace)
     n = length(v)
     fill!(rhs, 0.0)
     mul!(@view(rhs[1:nf]), model.X', v)
     for i in 1:n
         @inbounds rhs[nf+model.groups.obs_to_id[i]] += v[i]
     end
-    apply_Zs_transpose!(@view(rhs[nf+N+1:nf+2N]), v, model.groups)
+    apply_Zs_transpose!(@view(rhs[nf+N+1:nf+2N]), v, model.groups, ws.group_sum)
     env_offset = nf + 2N
     for h in 1:length(model.env_ids)
         ids = model.env_ids[h]
@@ -567,7 +602,7 @@ function solve_mme_y!(model::SGEModel, ws::ThreadWorkspace, P_inv; reltol=1e-7, 
     nf = size(model.X, 2)
 
     rhs = ws.rhs_buffer
-    build_rhs!(rhs, model.y, model, N, nf)
+    build_rhs!(rhs, model.y, model, N, nf, ws)
 
     op = make_mme_operator(model, ws)
     if verbose
@@ -590,7 +625,7 @@ function solve_mme_z!(sol_z_i::Vector{Float64}, model::SGEModel,
     nf = size(model.X, 2)
 
     rhs = ws.rhs_buffer
-    build_rhs!(rhs, z_vector, model, N, nf)
+    build_rhs!(rhs, z_vector, model, N, nf, ws)
 
     op = make_mme_operator(model, ws)
     if verbose
@@ -637,22 +672,18 @@ function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws:
 
     elseif type == :s # Zs * A * Zs' * u
         fill!(ws.tmp_N1, 0.0)
-        apply_Zs_transpose!(ws.tmp_N1, u_n, gs)
+        apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum)
         apply_A!(ws.tmp_N2, model.L_Ainv, ws.tmp_N1, ws.tmp_N3)
-        fill!(out, 0.0)
-        for (i, tid) in enumerate(gs.obs_to_id)
-            g_idx = gs.id_to_group[tid]
-            for bid in gs.members_id[g_idx]
-                if bid != tid
-                    @inbounds out[i] += ws.tmp_N2[bid]
-                end
-            end
+        # out[i] = (Σ_{bid ∈ g(i)} tmp_N2[bid]) - tmp_N2[obs_to_id[i]]  (peer sum, excl. self)
+        compute_group_sums!(ws.group_sum, ws.tmp_N2, gs.members_id)
+        @inbounds for (i, tid) in enumerate(gs.obs_to_id)
+            out[i] = ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]
         end
 
     elseif type == :ds # (Zd * A * Zs' + Zs * A * Zd') * u
         # Del 1: Zd * A * Zs' * u
         fill!(ws.tmp_N1, 0.0)
-        apply_Zs_transpose!(ws.tmp_N1, u_n, gs)
+        apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum)
         apply_A!(ws.tmp_N2, model.L_Ainv, ws.tmp_N1, ws.tmp_N3)
         for i in 1:n
             @inbounds out[i] = ws.tmp_N2[gs.obs_to_id[i]]
@@ -663,13 +694,10 @@ function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws:
             @inbounds ws.tmp_N1[gs.obs_to_id[i]] += u_n[i]
         end
         apply_A!(ws.tmp_N2, model.L_Ainv, ws.tmp_N1, ws.tmp_N3)
-        for (i, tid) in enumerate(gs.obs_to_id)
-            g_idx = gs.id_to_group[tid]
-            for bid in gs.members_id[g_idx]
-                if bid != tid
-                    @inbounds out[i] += ws.tmp_N2[bid]
-                end
-            end
+        # out[i] += (Σ_{bid ∈ g(i)} tmp_N2[bid]) - tmp_N2[obs_to_id[i]]
+        compute_group_sums!(ws.group_sum, ws.tmp_N2, gs.members_id)
+        @inbounds for (i, tid) in enumerate(gs.obs_to_id)
+            out[i] += ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]
         end
 
     else # :e
@@ -765,7 +793,7 @@ function compute_score_and_ai(model::SGEModel, Py, z_list, Pz_list, workspaces, 
             copyto!(tmp_sol, model.sol_y)
             solve_mme_direct!(tmp_sol, model, Vi_Py_list[j], ws, preconditioners[1],
                 reltol=ai_reltol, maxiter=ai_maxiter)
-            compute_Px_from_sol!(P_Vi_Py_list[j], model, Vi_Py_list[j], tmp_sol)
+            compute_Px_from_sol!(P_Vi_Py_list[j], model, Vi_Py_list[j], tmp_sol, ws)
         end
     end
 
@@ -819,7 +847,7 @@ function _threaded_ai_cg!(P_Vi_Py_list, Vi_Py_list, model, workspaces, precondit
         ws = workspaces[tid]
         solve_mme_direct!(tmp_sols[j], model, Vi_Py_list[j], ws, preconditioners[tid],
             reltol=ai_reltol, maxiter=ai_maxiter)
-        compute_Px_from_sol!(P_Vi_Py_list[j], model, Vi_Py_list[j], tmp_sols[j])
+        compute_Px_from_sol!(P_Vi_Py_list[j], model, Vi_Py_list[j], tmp_sols[j], ws)
     end
 end
 
@@ -840,7 +868,7 @@ function _threaded_z_solves!(model, z_fixed_list, Pz_list, workspaces, precondit
         ws = workspaces[tid]
         solve_mme_z!(model.sol_z[i], model, z_fixed_list[i], ws, preconditioners[tid],
             reltol=cg_reltol, maxiter=cg_maxiter)
-        compute_Px_from_sol!(Pz_list[i], model, z_fixed_list[i], model.sol_z[i])
+        compute_Px_from_sol!(Pz_list[i], model, z_fixed_list[i], model.sol_z[i], ws)
     end
 end
 
@@ -850,7 +878,7 @@ function solve_mme_direct!(x_sol, model::SGEModel, v_vector::Vector{Float64},
     N = size(model.Ainv, 1)
     nf = size(model.X, 2)
     rhs = ws.rhs_buffer
-    build_rhs!(rhs, v_vector, model, N, nf)
+    build_rhs!(rhs, v_vector, model, N, nf, ws)
 
     op = make_mme_operator(model, ws)
     cg!(x_sol, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter)
@@ -1082,7 +1110,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
         # 1. Oppdater modellens egne løsninger (Warm Start) — y-solve er sekvensiell
         t_y = @elapsed begin
             solve_mme_y!(model, workspaces[1], preconditioners[1], reltol=iter_cg_reltol, maxiter=cg_maxiter, verbose=verbose_cg)
-            compute_Px_from_sol!(Py, model, model.y, model.sol_y)
+            compute_Px_from_sol!(Py, model, model.y, model.sol_y, workspaces[1])
         end
 
         # 2. Parallelliser k z-solves
@@ -1099,7 +1127,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
                 for i in 1:k
                     solve_mme_z!(model.sol_z[i], model, z_fixed_list[i], ws, preconditioners[1],
                         reltol=iter_cg_reltol, maxiter=cg_maxiter, verbose=(verbose_cg && i == 1))
-                    compute_Px_from_sol!(Pz_list[i], model, z_fixed_list[i], model.sol_z[i])
+                    compute_Px_from_sol!(Pz_list[i], model, z_fixed_list[i], model.sol_z[i], ws)
                 end
             end
         end

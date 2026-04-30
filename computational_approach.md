@@ -42,7 +42,7 @@ Operationally, the contribution of an unobserved pedigree ID depends on availabl
 - If an ID is present only in the pedigree, it contributes through genetic covariance structure and is shrunk toward the pedigree prior.
 - If an ID is also represented in the group/design mapping used to build the social operator, it can additionally contribute through peer-structure equations even without its own outcome row.
 
-In the current `run_emai.jl` workflow, group/design mappings are built from the observed table (`yX.csv`). To activate the second case for missing-outcome individuals, the input pipeline must provide group membership independently of observed outcomes.
+In the current workflow, group/design mappings are built from the full `yX` roster, while observation rows for $\mathbf{y}$ and $X$ are filtered to non-missing outcomes. This preserves social-group membership for missing-outcome individuals and keeps effective peer counts (group size minus self) correct for observed rows.
 
 This separation is exactly why we distinguish $n$ (observed outcomes) from $N$ (all pedigree IDs): missing outcomes are integrated out at the observation level while still allowing genetic information propagation to unobserved individuals.
 
@@ -57,7 +57,7 @@ Required inputs in the current workflow are:
 | Outcome vector ($\mathbf{y}$) | $n$ | Observed response values |
 | Fixed-effect design ($X$) | $n \times n_f$ | Covariates and intercept |
 | Observation-to-pedigree IDs (`id_ped`) | $n$ | Maps each observed row to a pedigree ID in $1..N$ |
-| Peer-group IDs (`group`) | $n$ | Defines social exposure structure among observed rows |
+| Peer-group IDs (`group`) | roster rows (full `yX`) | Defines social exposure structure from full group membership; observed rows are mapped into this structure |
 | Sparse $A^{-1}$ triplets | on $N \times N$ | Pedigree precision structure |
 | Sparse Cholesky of $A^{-1}$ | on $N \times N$ | Enables implicit application of $A$ |
 | Optional environment IDs (`env_ids[h]`) | $n$ each | Observation-level grouping for each shared environment factor |

@@ -151,6 +151,17 @@ missing_idx = sample.int(nstudent, n_missing)
 datao$y[missing_idx] = NA_real_
 message(sprintf("Master yX table: %d total rows, %d observed, %d missing",
                 nstudent, nstudent - n_missing, n_missing))
+
+# New two-table contract:
+# 1) observed table for REML response/design and env mappings
+# 2) full roster table for social group membership
+obs_table = subset(datao, !is.na(y), select = c("y", "x", "id_ped"))
+roster = data.frame(id_ped = seq_len(nstudent), group = class)
+
+write_csv(obs_table, "yX_obs.csv")
+write_csv(roster, "roster.csv")
+
+# Legacy output retained for backward compatibility.
 write_csv(datao, "yX.csv", na = "")
 
 X = model.matrix(~ 1 + x2, data = datao)

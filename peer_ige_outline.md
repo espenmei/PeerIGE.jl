@@ -298,7 +298,7 @@ Core operations:
 
 ### 4.1 Note On Missing Outcomes And Group Size
 
-**Priority: implement before any real-data application.**
+**Status: implemented in current model code and smoke tests.**
 
 Handling missing outcomes in the IGE model requires care because the observation space and the group membership space are not the same thing.
 
@@ -315,22 +315,14 @@ The correct treatment separates three roles:
 | In group — social effect acts on pen-mates | All pen members, observed or not |
 | Has phenotype — row in **y** and **X** | Observed animals only |
 
-**Workaround until fixed:** drop rows with missing `y` from `yX` before running the model. This conflates the second and third roles and underestimates effective group size, but is otherwise safe for datasets with negligible missingness.
+Current implementation follows this separation by building observed-data objects ($\mathbf{y}$, $X$, observed ID mapping) from non-missing rows, while building social-group membership from the full roster mapping. As a result, missing-outcome group members remain in the social operator, and observed individuals retain correct leave-one-out peer counts.
 
-#### Minimal-change design for the fix
+#### Practical implication
 
-`GroupStructure` already separates the two concerns internally:
-- `members_id` / `id_to_group` — pedigree-level pen membership (used in `apply_ZsZs_accumulate!` and the social sum loop).
-- `obs_to_id` — maps observation rows to pedigree IDs (used in `apply_Zs_transpose!` and the RHS assembly).
+When outcomes are missing in a pen/class, the model still treats those unobserved members as social contributors to observed peers. This avoids undercounting group size and avoids attenuating the social genetic signal from omitted peers.
 
-The fix requires no changes to the MME operator or AI-REML code. Only `GroupStructure` and its constructor need to change, by accepting an optional separate full-roster input:
+This behavior is now a baseline assumption for empirical runs, not a future extension.
 
-```julia
-GroupStructure(obs_group_ids, obs_animal_ids, N_pedigree;
-               full_group_ids = nothing, full_animal_ids = nothing)
-```
-
-If `full_*` is supplied, `members_id` and `id_to_group` are built from the complete pen roster; `obs_to_id` is still built from the observed subset only. If `full_*` is omitted, behavior is identical to today (backward-compatible). The call site in `run_emai.jl` passes an optional pen-roster CSV alongside `yX`.
 
 ---
 

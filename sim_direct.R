@@ -127,6 +127,17 @@ nclass = nstudent %/% 20L
 class  = sample.int(nclass, nstudent, replace = TRUE)
 
 datao = data.frame(y = y_obs, x = x2, group = class, id_ped = seq_len(nstudent))
+
+# New two-table contract:
+# 1) observed table for REML response/design
+# 2) full roster table for social group membership
+obs_table = data.frame(y = y_obs, x = x2, id_ped = seq_len(nstudent))
+roster = data.frame(id_ped = seq_len(nstudent), group = class)
+
+write_csv(obs_table, "yX_obs.csv")
+write_csv(roster, "roster.csv")
+
+# Legacy output retained for backward compatibility.
 write_csv(datao, "yX.csv")
 
 cat(sprintf("Ferdig! N = %d, n = %d, nclass = %d\n", nstudent, nstudent, nclass))

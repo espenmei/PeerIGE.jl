@@ -182,6 +182,18 @@ datao = data.frame(y = y_obs, x = x2, group = class, id_ped = seq_len(nstudent),
                    household = household_dense,
                    classroom = classroom_dense,
                    school = school_dense)
+
+# New two-table contract:
+# 1) observed table for REML response/design and environment effects
+# 2) full roster table for social group membership
+obs_table = subset(datao, !is.na(y),
+                   select = c("y", "x", "id_ped", "household", "classroom", "school"))
+roster = data.frame(id_ped = seq_len(nstudent), group = class)
+
+write_csv(obs_table, "yX_obs.csv")
+write_csv(roster, "roster.csv")
+
+# Legacy output retained for backward compatibility.
 write_csv(datao, "yX.csv")
 cat(sprintf(
   "True variances: household=%.2f classroom=%.2f school=%.2f | n_households=%d n_classrooms=%d n_schools=%d\n",

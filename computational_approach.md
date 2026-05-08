@@ -30,7 +30,57 @@ The solution vector in the MME has dimension $\dim = n_f + 2N + \sum_h n_h$, whe
 - $n \approx 1{,}000{,}000$ (observed individuals)
 - $\dim(\text{MME}) = n_f + 2N + \sum_h n_h \approx 14{,}000{,}000 + \sum_h n_h$ (the env term adds one dimension per distinct level per factor)
 
-### 1.1 Missing outcome data (observed-data formulation)
+### 1.1 Why this becomes a computational problem
+
+For a behavior-genetic audience, the main point is not that the statistical model is unusually exotic. The main point is that a scientifically natural model leads to a computational object that is too large for naive mixed-model software.
+
+The modeling ingredients are familiar:
+- fixed effects for measured covariates,
+- one direct genetic effect per pedigree individual,
+- one social genetic effect per pedigree individual,
+- optional shared environment effects,
+- pedigree-based covariance through $A$.
+
+What makes the problem hard is the scale of the implied linear system. Once the model is written as Henderson's mixed model equations, the unknown vector has dimension
+
+$$\dim = n_f + 2N + \sum_h n_h.$$
+
+With pedigree-scale data, this is not a bookkeeping detail. It is the central computational bottleneck. Even before considering repeated REML iterations, the naive coefficient matrix would have dimension roughly $14$ million by $14$ million on the real data scale.
+
+This is why the computational contribution matters scientifically: the goal is not to fit a different simplified model, but to fit the same direct-plus-social genetic model without ever constructing the impossible matrix that the textbook formulation suggests.
+
+### 1.2 Communicating the scale to non-specialists
+
+An effective way to explain the difficulty is to contrast the scientific model with the naive computation it implies.
+
+| Scientific question | Naive computation | Why it fails |
+|---|---|---|
+| Estimate direct and social genetic effects jointly | Form the full MME coefficient matrix | The matrix dimension is on the order of $n_f + 2N + \sum_h n_h$, which is far too large to store densely |
+| Use REML for variance components | Repeatedly factorize or invert very large matrices | AI-REML requires many large linear solves across iterations |
+| Use pedigree relationships | Form $A$ explicitly | $A$ is dense and enormous even when $A^{-1}$ is sparse |
+
+The practical message is simple: the obstacle is not just that the model is "a bit slower" than a standard animal model. The obstacle is that the obvious dense computation is not feasible in memory or time.
+
+If one were to store a dense matrix of dimension $d$, the storage alone would be approximately
+
+$$8d^2 \text{ bytes}.$$
+
+So even a problem with $d = 200{,}000$ would already require about $320$ GB just to store one dense double-precision matrix. At the real pedigree scale considered here, direct dense storage is completely out of reach, which is why all core computations must be sparse and matrix-free.
+
+### 1.3 Visual intuition: sparsity does not survive the covariance construction
+
+The figure below is useful for communicating why the covariance-side formulation becomes difficult even when some of the building blocks look sparse or structured.
+
+![Covariance illustration comparing the pedigree relationship matrix $A$, the social-design cross-product $Z_s Z_s'$, and the induced social-genetic covariance term $Z_s A Z_s'$. The main point is that the propagated covariance can be substantially denser than the structured ingredients used to define it.](covariance_illustration.png)
+
+The key message is not that every intermediate matrix is dense. It is that the covariance contribution induced by social structure and pedigree propagation can become much denser than the original ingredients. In particular:
+- the pedigree precision machinery is exploitable because $A^{-1}$ and its sparse Cholesky factor are sparse,
+- the social-design cross-product $Z_s Z_s'$ is still highly structured,
+- but the propagated covariance term $Z_s A Z_s'$ is much denser, which makes direct covariance construction, storage, and factorization unattractive.
+
+For a methodological behavior-genetics audience, this picture helps separate two ideas that are easy to conflate: pedigree computations can exploit sparse precision structure, while the marginal covariance seen by the phenotype can still become computationally unwieldy.
+
+### 1.4 Missing outcome data (observed-data formulation)
 
 The implementation uses an **observed-data REML formulation**:
 - $n$ is the number of individuals with observed outcome values used in $\mathbf{y}$ and $X$.
@@ -42,11 +92,11 @@ Operationally, the contribution of an unobserved pedigree ID depends on availabl
 - If an ID is present only in the pedigree, it contributes through genetic covariance structure and is shrunk toward the pedigree prior.
 - If an ID is also represented in the group/design mapping used to build the social operator, it can additionally contribute through peer-structure equations even without its own outcome row.
 
-In the current workflow, group/design mappings are built from the full `yX` roster, while observation rows for $\mathbf{y}$ and $X$ are filtered to non-missing outcomes. This preserves social-group membership for missing-outcome individuals and keeps effective peer counts (group size minus self) correct for observed rows.
+In the current workflow, observation rows for $\mathbf{y}$ and $X$ come from `yX_obs.csv`, while social group membership is supplied separately through the full `roster.csv` file. This preserves social-group membership for missing-outcome individuals and keeps effective peer counts (group size minus self) correct for observed rows.
 
 This separation is exactly why we distinguish $n$ (observed outcomes) from $N$ (all pedigree IDs): missing outcomes are integrated out at the observation level while still allowing genetic information propagation to unobserved individuals.
 
-### 1.2 Required input data and effect scope
+### 1.5 Required input data and effect scope
 
 The model requires two linked data layers: an observed-data layer (length $n$) and a pedigree layer (size $N$).
 
@@ -56,11 +106,13 @@ Required inputs in the current workflow are:
 |---|---|---|
 | Outcome vector ($\mathbf{y}$) | $n$ | Observed response values |
 | Fixed-effect design ($X$) | $n \times n_f$ | Covariates and intercept |
-| Observation-to-pedigree IDs (`id_ped`) | $n$ | Maps each observed row to a pedigree ID in $1..N$ |
-| Peer-group IDs (`group`) | roster rows (full `yX`) | Defines social exposure structure from full group membership; observed rows are mapped into this structure |
+| Observation-to-pedigree IDs (`id_ped`) | $n$ | Maps each observed row in `yX_obs.csv` to a pedigree ID in $1..N$ |
+| Peer-group roster (`roster.csv`) | roster rows | Defines social exposure structure from full group membership; observed rows are mapped into this structure |
 | Sparse $A^{-1}$ triplets | on $N \times N$ | Pedigree precision structure |
 | Sparse Cholesky of $A^{-1}$ | on $N \times N$ | Enables implicit application of $A$ |
 | Optional environment IDs (`env_ids[h]`) | $n$ each | Observation-level grouping for each shared environment factor |
+
+In the current implementation, `yX_obs.csv` must contain one row per observed outcome, including `y`, `id_ped`, and any covariates included in $X$. Optional environment columns such as `household`, `classroom`, and `school` also live in `yX_obs.csv`. The separate `roster.csv` file contains `id_ped` and `group` for all pedigree IDs that participate in the social grouping structure, including individuals without an observed outcome.
 
 This implies different scope for different random effects:
 
@@ -75,6 +127,14 @@ Practically, this means:
 2. Environment effects are estimated for levels represented in the supplied `env_ids` mapping.
 3. Expanding environment effects beyond observed rows would require an expanded input mapping design, not only a larger pedigree.
 
+### 1.6 Data organization and cache efficiency
+
+**Row ordering in `yX_obs.csv` affects computational performance.** The critical inner loop (`apply_Zs_transpose!` and related group-sum operations) repeatedly accesses the group-sum buffer using observation indices. If observations are **ordered by social group**, these accesses exhibit strong spatial locality, keeping the group-sum array warm in L1/L2 cache throughout iteration. Random ordering causes frequent cache misses.
+
+**Recommendation:** Sort `yX_obs.csv` rows by the `group` column (primary key), then by `id_ped` (secondary key). This clustering can yield **5–15% wall-clock speedup** in the hot loop, depending on group size and system cache size, without algorithmic cost.
+
+`roster.csv` and the sparse matrix files do not benefit materially from sorting; they are processed differently or only once during setup.
+
 ## 2. Mixed Model Equations (MME)
 
 Henderson's MME for this model are:
@@ -84,6 +144,20 @@ $$\underbrace{\begin{pmatrix} X'X & X'Z_d & X'Z_s \\ Z_d'X & Z_d'Z_d + \lambda_{
 where $\Lambda = G^{-1}\sigma^2_e$ provides the ratios $\lambda_{dd}, \lambda_{ds}, \lambda_{ss}$.
 
 The coefficient matrix $C$ is of dimension $(n_f + 2N + \sum_h n_h) \times (n_f + 2N + \sum_h n_h)$ — roughly $\gtrsim 14M$ with env effects included — and is never formed explicitly. Instead, we implement it as a **matrix-free operator** that computes $C \cdot v$ for any vector $v$ via component-wise operations.
+
+For presentation purposes, this is the key computational message: the inferential target is standard REML for a pedigree mixed model, but the algorithm succeeds only because it replaces explicit matrix construction with repeated operator applications and iterative solves.
+
+### 2.1 Why not use a sparse direct solver on the MME?
+
+This argument is also intended to rule out an obvious alternative: assembling the sparse MME and solving it by sparse Cholesky or sparse LDL$'$ factorization at each REML iteration.
+
+In principle, the MME coefficient matrix is structured and many of its ingredients are sparse or implicitly sparse. In practice, however, sparse direct methods are still unattractive at the target scale for three related reasons:
+
+1. The system dimension is enormous, so even storing the assembled MME is already a major burden.
+2. Sparse factorization introduces substantial fill-in, especially once the direct-effect, social-effect, and pedigree-coupling blocks interact.
+3. AI-REML requires repeated solves as the variance components change, so a sparse direct factorization would need to be rebuilt or heavily updated many times across iterations.
+
+So the issue is not only whether one sparse factorization is theoretically possible. The issue is whether repeated factorization of a changing, extremely large system is computationally realistic. The matrix-free PCG approach is chosen because it avoids assembling $C$, avoids factorization fill-in, and reduces the repeated work to operator applications plus preconditioned iterative solves.
 
 ## 3. Why Not Direct Likelihood Optimisation?
 
@@ -142,6 +216,13 @@ The trace $\text{tr}(PV_i)$ is intractable for large $n$. We use the **Hutchinso
 $$\text{tr}(PV_i) \approx \frac{1}{k} \sum_{j=1}^{k} \mathbf{z}_j' V_i P\mathbf{z}_j$$
 
 Each $P\mathbf{z}_j$ requires solving the MME with $\mathbf{z}_j$ as the right-hand side (same structure as for $P\mathbf{y}$). The same $k$ probe vectors are reused across all REML iterations for comparability.
+
+This is the point where randomized methods enter for a fundamental reason, not as a convenience add-on. The difficult term is the trace itself. Computing $\text{tr}(PV_i)$ exactly would require access to diagonal or factorization information about an operator built from very large solves, which would largely undo the computational savings of the matrix-free formulation. Hutchinson's estimator replaces that exact trace with an unbiased Monte Carlo estimate that only requires matrix-vector style operations and the same MME solves already needed elsewhere in AI-REML.
+
+So the logic is:
+- iterative methods are used because repeated direct factorization of the MME is not scalable,
+- randomized trace estimation is used because exact trace evaluation is not scalable,
+- both choices are driven by the same goal: keep every expensive step reducible to repeated applications of structured operators and large linear solves.
 
 ### 3.3 Average Information matrix
 
@@ -280,7 +361,7 @@ Standard errors for the variance components are obtained from the inverse of the
 
 - **Julia 1.12** with `IterativeSolvers.jl` (PCG solver), `SparseArrays`, `JLD2`
 - **R** for pedigree processing: computing $A^{-1}$ (Henderson's rules) and its Cholesky factor $L$, exported as sparse triplet CSV files
-- Data exchange via CSV (triplet format for sparse matrices, dense format for $y$, $X$, group assignments)
+- Data exchange via CSV (triplet format for sparse matrices; dense observed-data table in `yX_obs.csv`; full social roster in `roster.csv`)
 
 ## References
 

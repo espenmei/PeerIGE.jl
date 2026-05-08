@@ -1,9 +1,9 @@
 include("emai.jl")
 using Printf, Random
 
-yX = DataFrame(CSV.File("yX.csv"))
-X_df = DataFrame(CSV.File("X.csv"))
-obs = load_observed_data(yX; X_df=X_df)
+obs_table = DataFrame(CSV.File("yX_obs.csv"))
+roster = DataFrame(CSV.File("roster.csv"))
+obs = load_observed_data(obs_table; covariate_cols=[:x])
 X = obs.X
 y = obs.y
 n = length(y); nf = size(X, 2)
@@ -14,8 +14,8 @@ Ainv = sparse(vcat(i_v, j_v[od]), vcat(j_v, i_v[od]), vcat(x_v, x_v[od]))
 N_ped = size(Ainv, 1)
 L_Ainv_df = DataFrame(CSV.File("LAinv_triplet.csv"))
 L_Ainv = LowerTriangular(sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"])))
-gs = build_group_structure(yX, N_ped, obs.obs_mask)
-hh = observed_env_ids(yX, obs.obs_mask, [:household])[1]
+gs = build_group_structure(obs_table, roster, N_ped)
+hh = observed_env_ids(obs_table, [:household])[1]
 
 for (label, k_val) in [("k=20", 20), ("k=10", 10)]
     m1 = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0; env_ids=[hh], σ2_env=[0.5])

@@ -827,14 +827,17 @@ function run_aireml(model::DirectModel; max_iter=15, k=5, damping=0.2,
     return result
 end
 
-function load_emai_direct_model(; yx_path::String="yX.csv",
+function load_emai_direct_model(; yx_path::String="yX_obs.csv",
     Ainv_path::String="Ainv_triplet.csv", L_Ainv_path::String="LAinv_triplet.csv",
     σ2_d::Float64=1.0, σ2_e::Float64=2.0)
     yX = DataFrame(CSV.File(yx_path))
-    obs_mask = .!ismissing.(yX[:, :y])
-    n = count(obs_mask)
-    X = hcat(ones(n), Float64.(yX[obs_mask, :x]))
-    y = Float64.(yX[obs_mask, :y])
+    @assert hasproperty(yX, :y) "Observed table must contain column :y"
+    @assert hasproperty(yX, :id_ped) "Observed table must contain column :id_ped"
+    @assert hasproperty(yX, :x) "Observed table must contain column :x"
+    @assert !any(ismissing.(yX[:, :y])) "yX_obs.csv must contain observed y only (no missing values)"
+    n = nrow(yX)
+    X = hcat(ones(n), Float64.(yX[:, :x]))
+    y = Float64.(yX[:, :y])
 
     Ainv_df = DataFrame(CSV.File(Ainv_path))
     i_vals = Ainv_df[:, "i"]
@@ -852,11 +855,11 @@ function load_emai_direct_model(; yx_path::String="yX.csv",
     L_Ainv = sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"]))
     L_Ainv = LowerTriangular(L_Ainv)
 
-    obs_to_id = Int.(yX[obs_mask, :id_ped])
+    obs_to_id = Int.(yX[:, :id_ped])
     return DirectModel(y, X, Ainv, L_Ainv, obs_to_id, σ2_d, σ2_e)
 end
 
-function run_emai_direct(; yx_path::String="yX.csv",
+function run_emai_direct(; yx_path::String="yX_obs.csv",
     Ainv_path::String="Ainv_triplet.csv", L_Ainv_path::String="LAinv_triplet.csv",
     output_path::String="aireml_direct_result.jld2", log_path::String="aireml_direct_log.csv",
     σ2_d::Float64=1.0, σ2_e::Float64=2.0, kwargs...)

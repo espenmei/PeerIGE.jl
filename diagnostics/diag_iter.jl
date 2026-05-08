@@ -14,9 +14,9 @@ if Threads.nthreads() == 1
 end
 
 # --- Load data ---
-yX = DataFrame(CSV.File("yX.csv"))
-X_df = DataFrame(CSV.File("X.csv"))
-obs = load_observed_data(yX; X_df=X_df)
+obs_table = DataFrame(CSV.File("yX_obs.csv"))
+roster = DataFrame(CSV.File("roster.csv"))
+obs = load_observed_data(obs_table; covariate_cols=[:x])
 X = obs.X
 y = obs.y
 n = length(y)
@@ -31,8 +31,8 @@ N_ped = size(Ainv, 1)
 L_Ainv_df = DataFrame(CSV.File("LAinv_triplet.csv"))
 L_Ainv = LowerTriangular(sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"])))
 
-gs = build_group_structure(yX, N_ped, obs.obs_mask)
-has_env = "household" in names(yX)
+gs = build_group_structure(obs_table, roster, N_ped)
+has_env = "household" in names(obs_table)
 
 function run_one_iter(label, model; threaded)
     println("\n--- $label (threaded=$threaded) ---")
@@ -159,5 +159,5 @@ if has_env
     h1_ok = max_dd < 1e-3
     println("  H=1 threading: $(h1_ok ? "✓ MATCH" : "✗ DIVERGED")")
 else
-    println("\nSkipping H=1 test (no household column in yX.csv)")
+    println("\nSkipping H=1 test (no household column in yX_obs.csv)")
 end

@@ -24,9 +24,9 @@ function check_test(name, ok, detail="")
 end
 
 # --- Load data ---
-yX = DataFrame(CSV.File("yX.csv"))
-X_df = DataFrame(CSV.File("X.csv"))
-obs = load_observed_data(yX; X_df=X_df)
+obs_table = DataFrame(CSV.File("yX_obs.csv"))
+roster = DataFrame(CSV.File("roster.csv"))
+obs = load_observed_data(obs_table; covariate_cols=[:x])
 X = obs.X
 y = obs.y
 n = length(y)
@@ -41,9 +41,9 @@ N_ped = size(Ainv, 1)
 L_Ainv_df = DataFrame(CSV.File("LAinv_triplet.csv"))
 L_Ainv = LowerTriangular(sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"])))
 
-gs = build_group_structure(yX, N_ped, obs.obs_mask)
-has_env = "household" in names(yX)
-hh = has_env ? observed_env_ids(yX, obs.obs_mask, [:household])[1] : nothing
+gs = build_group_structure(obs_table, roster, N_ped)
+has_env = "household" in names(obs_table)
+hh = has_env ? observed_env_ids(obs_table, [:household])[1] : nothing
 
 function make_model()
     if has_env

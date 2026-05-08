@@ -15,9 +15,9 @@ if Threads.nthreads() == 1
 end
 
 # --- Load data ---
-yX = DataFrame(CSV.File("yX.csv"))
-X_df = DataFrame(CSV.File("X.csv"))
-obs = load_observed_data(yX; X_df=X_df)
+obs_table = DataFrame(CSV.File("yX_obs.csv"))
+roster = DataFrame(CSV.File("roster.csv"))
+obs = load_observed_data(obs_table; covariate_cols=[:x])
 X = obs.X
 y = obs.y
 
@@ -30,10 +30,10 @@ N_pedigree = size(Ainv, 1)
 L_Ainv_df = DataFrame(CSV.File("LAinv_triplet.csv"))
 L_Ainv = LowerTriangular(sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"])))
 
-gs = build_group_structure(yX, N_pedigree, obs.obs_mask)
+gs = build_group_structure(obs_table, roster, N_pedigree)
 
 # Use env if household column exists
-has_env = "household" in names(yX)
+has_env = "household" in names(obs_table)
 
 # --- Settings ---
 # Run enough iterations for convergence so we can compare final estimates.
@@ -44,7 +44,7 @@ bench_settings = (max_iter=10, k=20, damping=0.5,
 
 function make_model()
     if has_env
-        hh = observed_env_ids(yX, obs.obs_mask, [:household])[1]
+        hh = observed_env_ids(obs_table, [:household])[1]
         SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0; env_ids=[hh], σ2_env=[0.5])
     else
         SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)

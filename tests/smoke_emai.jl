@@ -66,11 +66,11 @@ try
     println("[Smoke test] Test 0c PASS (small-group peer counts)")
 
     # Load the same inputs as the main runner.
-    yX = DataFrame(CSV.File("yX.csv"))
-    X_df = DataFrame(CSV.File("X.csv"))
-    obs = load_observed_data(yX; X_df=X_df)
-    X = obs.X
-    y = obs.y
+    obs_table = DataFrame(CSV.File("yX_obs.csv"))
+    roster = DataFrame(CSV.File("roster.csv"))
+    y = Float64.(obs_table[:, :y])
+    X = hcat(ones(length(y)), Float64.(obs_table[:, :x]))
+    obs_to_id = Int.(obs_table[:, :id_ped])
 
     Ainv_df = DataFrame(CSV.File("Ainv_triplet.csv"))
     i_vals = Ainv_df[:, "i"]
@@ -89,7 +89,15 @@ try
     L_Ainv = sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"]))
     L_Ainv = LowerTriangular(L_Ainv)
 
-    gs = build_group_structure(yX, N_pedigree, obs.obs_mask)
+    roster_ids = Int.(roster[:, :id_ped])
+    roster_groups = Int.(roster[:, :group])
+    obs_group_lookup = zeros(Int, N_pedigree)
+    for (id, g) in zip(roster_ids, roster_groups)
+        obs_group_lookup[id] = g
+    end
+    obs_group_ids = [obs_group_lookup[id] for id in obs_to_id]
+    gs = GroupStructure(obs_group_ids, obs_to_id, N_pedigree;
+        all_group_ids=roster_groups, all_animal_ids=roster_ids)
 
     # --- TEST 1: H=0 (regression, same as before) ---
     println("[Smoke test] Test 1: H=0 (no env effects)...")
@@ -127,7 +135,7 @@ try
 
     # --- TEST 2: H=1 (one env factor, using group as env_ids) ---
     println("[Smoke test] Test 2: H=1 (one env factor)...")
-    env1_ids = observed_env_ids(yX, obs.obs_mask, [:group])[1]
+    env1_ids = obs_group_ids
     model1 = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
         env_ids=[env1_ids], σ2_env=[0.5])
 

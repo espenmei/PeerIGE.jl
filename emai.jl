@@ -89,6 +89,8 @@ struct GroupStructure
     obs_to_id::Vector{Int}          # Hvilken stamtavle-ID har obs i? (1..n)
     id_to_group::Vector{Int}        # Hvilken gruppe tilhører stamtavle-ID i?
     obs_to_group::Vector{Int}       # Precomputed: hvilken gruppe tilhører obs i? (1..num_groups)
+    obs_count_per_group::Vector{Int} # o_g: antall observerte rader i gruppe g (1..num_groups)
+    is_observed::Vector{Bool}       # length N_pedigree; true hvis pedigree-ID har obs-rad
 end
 
 function GroupStructure(group_ids::Vector{Int}, animal_ids::Vector{Int}, N_pedigree::Int;
@@ -136,7 +138,17 @@ function GroupStructure(group_ids::Vector{Int}, animal_ids::Vector{Int}, N_pedig
 
     obs_to_group = [id_to_group[id] for id in animal_ids]
 
-    return GroupStructure(members, animal_ids, id_to_group, obs_to_group)
+    # Per-group observed count and per-pedigree observed flag.
+    # Needed by apply_ZsZs_accumulate! to handle missing-obs members correctly.
+    obs_count_per_group = zeros(Int, num_groups)
+    is_observed = falses(N_pedigree)
+    for (i, id) in enumerate(animal_ids)
+        obs_count_per_group[obs_to_group[i]] += 1
+        is_observed[id] = true
+    end
+
+    return GroupStructure(members, animal_ids, id_to_group, obs_to_group,
+        obs_count_per_group, is_observed)
 end
 
 mutable struct SGEModel
@@ -169,6 +181,8 @@ mutable struct SGEModel
     op_Ad::Vector{Float64}    # length N
     op_As::Vector{Float64}    # length N
     op_Ginv::Matrix{Float64}  # 2×2 cached Ginv*σ²_e
+    ψ::Float64                # Dilution exponent: social peer sum scaled by (m_g-1)^{-ψ}
+    group_scale::Vector{Float64}  # Per-group dilution factor; 1.0 when ψ=0, 0.0 when m_g<=1
 end
 
 # Beregner total dimensjon for løsningsvektoren
@@ -179,7 +193,8 @@ function get_dim(model::SGEModel)
 end
 
 function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
-    env_ids::Vector{Vector{Int}}=Vector{Int}[], σ2_env::Vector{Float64}=Float64[])
+    env_ids::Vector{Vector{Int}}=Vector{Int}[], σ2_env::Vector{Float64}=Float64[],
+    ψ::Float64=0.0)
     N = size(Ainv, 1)
     n = length(y)
     nf = size(X, 2)
@@ -216,10 +231,13 @@ function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
     op_Ad = zeros(N)
     op_As = zeros(N)
     op_Ginv = zeros(2, 2)
+    group_scale = [length(m) <= 1 ? 0.0 : (ψ == 0.0 ? 1.0 : Float64(length(m) - 1)^(-ψ))
+                   for m in groups.members_id]
     return SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e,
         env_ids, env_n_levels, env_counts, σ2_env,
         sol_y, sol_z, rhs_buffer, tmp_N1, tmp_N2, tmp_N3,
-        op_wn, op_wn2, op_wdim, op_Ad, op_As, op_Ginv)
+        op_wn, op_wn2, op_wdim, op_Ad, op_As, op_Ginv,
+        ψ, group_scale)
 end
 
 function load_observed_data(yX::DataFrame;
@@ -268,11 +286,43 @@ function build_group_structure(yX::DataFrame, N_pedigree::Int, obs_mask::Abstrac
         all_group_ids=Int.(yX[:, :group]), all_animal_ids=Int.(yX[:, :id_ped]))
 end
 
+function build_group_structure(obs_table::DataFrame, roster::DataFrame, N_pedigree::Int)
+    @assert hasproperty(obs_table, :id_ped) "obs_table must contain column :id_ped"
+    @assert hasproperty(roster, :group) "roster must contain column :group"
+    @assert hasproperty(roster, :id_ped) "roster must contain column :id_ped"
+
+    obs_to_id = Int.(obs_table[:, :id_ped])
+    roster_ids = Int.(roster[:, :id_ped])
+    roster_groups = Int.(roster[:, :group])
+
+    obs_group_lookup = zeros(Int, N_pedigree)
+    for (id, g) in zip(roster_ids, roster_groups)
+        prev = obs_group_lookup[id]
+        @assert prev == 0 || prev == g "Roster id_ped $id appears in multiple groups"
+        obs_group_lookup[id] = g
+    end
+
+    obs_group_ids = [obs_group_lookup[id] for id in obs_to_id]
+    @assert all(g -> g != 0, obs_group_ids) "Every observed id_ped must have a group in roster.csv"
+
+    return GroupStructure(obs_group_ids, obs_to_id, N_pedigree;
+        all_group_ids=roster_groups, all_animal_ids=roster_ids)
+end
+
 function observed_env_ids(yX::DataFrame, obs_mask::AbstractVector{Bool}, cols::Vector{Symbol})
     ids = Vector{Vector{Int}}()
     for col in cols
         @assert hasproperty(yX, col) "yX must contain column :$col"
         push!(ids, Int.(yX[obs_mask, col]))
+    end
+    return ids
+end
+
+function observed_env_ids(obs_table::DataFrame, cols::Vector{Symbol})
+    ids = Vector{Vector{Int}}()
+    for col in cols
+        @assert hasproperty(obs_table, col) "obs_table must contain column :$col"
+        push!(ids, Int.(obs_table[:, col]))
     end
     return ids
 end
@@ -398,7 +448,7 @@ function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::V
         target_id = gs.obs_to_id[i]
         out[i] += a_d[target_id]
         g_idx = gs.obs_to_group[i]
-        out[i] += ws.group_sum[g_idx] - a_s[target_id]  # peer sum (excl. self)
+        out[i] += (ws.group_sum[g_idx] - a_s[target_id]) * model.group_scale[g_idx]  # scaled peer sum (excl. self)
     end
 
     # + env contributions: Zh * ch
@@ -441,44 +491,70 @@ end
 # Implementasjon: først akkumuler obs_sum[g] = Σ u[i] per gruppe (O(n)),
 # deretter spre obs_sum til alle medlemmer av g (O(Σ m_g)),
 # og trekk fra self-bidraget per obs (O(n)).
-function apply_Zs_transpose!(v_N, u_n, gs::GroupStructure, group_sum::Vector{Float64})
+function apply_Zs_transpose!(v_N, u_n, gs::GroupStructure, group_sum::Vector{Float64}, group_scale::Vector{Float64})
     # Steg 1: obs_sum[g] = Σ_{i: g(i)=g} u_n[i]
     fill!(group_sum, 0.0)
     @inbounds for i in eachindex(u_n)
         group_sum[gs.obs_to_group[i]] += u_n[i]
     end
-    # Steg 2: spre obs_sum til alle medlemmer
+    # Steg 2: spre obs_sum (skalert med c_g) til alle medlemmer
     @inbounds for g in eachindex(gs.members_id)
-        s = group_sum[g]
+        s = group_sum[g] * group_scale[g]
         if s != 0.0
             for bid in gs.members_id[g]
                 v_N[bid] += s
             end
         end
     end
-    # Steg 3: trekk fra self-bidrag
+    # Steg 3: trekk fra self-bidrag (skalert med c_{g(i)})
     @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
-        v_N[target_id] -= u_n[i]
+        v_N[target_id] -= u_n[i] * group_scale[gs.obs_to_group[i]]
     end
     return v_N
 end
 
-# BEREGNER: Zs' * Zs * v_s (Den optimaliserte snarveien for sosiale effekter)
-function apply_ZsZs_accumulate!(u_N, v_N, gs::GroupStructure)
-    for members in gs.members_id
-        ng = length(members)
-        if ng <= 1
+# BEREGNER: Zs' * Zs * v_s
+# Med missing-obs (o_g <= m_g): Zs har rader for observerte obs og kolonner for
+# alle pedigree-IDer i en gruppe (også uobserverte medlemmer bidrar til peer-sum).
+# La S_g^full = Σ_{b ∈ members_g} v[b],  S_g^obs = Σ_{b ∈ obs members_g} v[b],
+#    o_g     = antall observerte i gruppe g.
+# Da gjelder for hvert medlem b ∈ members_g:
+#   (Zs'Zs v)[b] = is_obs[b] · (v[b] - S_g^full)  +  o_g · S_g^full  -  S_g^obs
+# Når alle medlemmer er observerte (o_g = m_g, S_obs = S_full, is_obs[b]=1) reduserer
+# dette til v[b] + (m_g - 2) S_full (gammel rask vei).
+function apply_ZsZs_accumulate!(u_N, v_N, gs::GroupStructure, group_scale::Vector{Float64})
+    @inbounds for g in eachindex(gs.members_id)
+        members = gs.members_id[g]
+        m_g = length(members)
+        if m_g <= 1
             continue
         end
-        # Manuell sum — unngår SubArray-allokering fra @view med Vector{Int}-indeks
-        group_sum = 0.0
-        @inbounds for id in members
-            group_sum += v_N[id]
+        o_g = gs.obs_count_per_group[g]
+        if o_g == 0
+            continue  # ingen obs i gruppen — Zs har ingen rader her, bidrag = 0
         end
-        @inbounds for id in members
-            u_N[id] += (ng - 2) * group_sum + v_N[id]
+
+        s_full = 0.0
+        s_obs = 0.0
+        for bid in members
+            vb = v_N[bid]
+            s_full += vb
+            if gs.is_observed[bid]
+                s_obs += vb
+            end
+        end
+
+        c2_g = group_scale[g]^2
+        const_add = c2_g * (o_g * s_full - s_obs)
+        for bid in members
+            base = const_add
+            if gs.is_observed[bid]
+                base += c2_g * (v_N[bid] - s_full)
+            end
+            u_N[bid] += base
         end
     end
+    return u_N
 end
 
 # BEREGNER: (Ginv ⊗ Ainv) * v (Slektskapsbidraget)
@@ -532,9 +608,9 @@ function (op::MMEOperator{T})(res, v) where T
 
     # 2. SOSIALE EFFEKTER (res_s)
     # Krydsledd: Zs' * y_hat  (X*v_f + Zd*v_d + sum Zh*v_h) — ingen re-beregning
-    apply_Zs_transpose!(res_s, y_hat, gs, op.group_sum)
+    apply_Zs_transpose!(res_s, y_hat, gs, op.group_sum, m.group_scale)
     # Ledd: Zs' * Zs * vs
-    apply_ZsZs_accumulate!(res_s, v_s, gs)
+    apply_ZsZs_accumulate!(res_s, v_s, gs, m.group_scale)
 
     # 3. Fullfør y_hat: legg til Zs * v_s (gjenbruker workspace_n2)
     tmp_zs = op.workspace_n2
@@ -542,7 +618,7 @@ function (op::MMEOperator{T})(res, v) where T
     # Cache group_sum for v_s
     compute_group_sums!(op.group_sum, v_s, gs.members_id)
     @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
-        tmp_zs[i] = op.group_sum[gs.obs_to_group[i]] - v_s[target_id]
+        tmp_zs[i] = (op.group_sum[gs.obs_to_group[i]] - v_s[target_id]) * m.group_scale[gs.obs_to_group[i]]
     end
     y_hat .+= tmp_zs
 
@@ -582,7 +658,7 @@ function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGE
     for i in 1:n
         @inbounds rhs[nf+model.groups.obs_to_id[i]] += v[i]
     end
-    apply_Zs_transpose!(@view(rhs[nf+N+1:nf+2N]), v, model.groups, ws.group_sum)
+    apply_Zs_transpose!(@view(rhs[nf+N+1:nf+2N]), v, model.groups, ws.group_sum, model.group_scale)
     env_offset = nf + 2N
     for h in 1:length(model.env_ids)
         ids = model.env_ids[h]
@@ -670,20 +746,20 @@ function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws:
             @inbounds out[i] = ws.tmp_N2[gs.obs_to_id[i]]
         end
 
-    elseif type == :s # Zs * A * Zs' * u
+    elseif type == :s # Zs_ψ * A * Zs_ψ' * u
         fill!(ws.tmp_N1, 0.0)
-        apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum)
+        apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum, model.group_scale)
         apply_A!(ws.tmp_N2, model.L_Ainv, ws.tmp_N1, ws.tmp_N3)
-        # out[i] = (Σ_{bid ∈ g(i)} tmp_N2[bid]) - tmp_N2[obs_to_id[i]]  (peer sum, excl. self)
+        # out[i] = c_{g(i)} * ((Σ_{bid ∈ g(i)} tmp_N2[bid]) - tmp_N2[obs_to_id[i]])
         compute_group_sums!(ws.group_sum, ws.tmp_N2, gs.members_id)
         @inbounds for (i, tid) in enumerate(gs.obs_to_id)
-            out[i] = ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]
+            out[i] = (ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]) * model.group_scale[gs.obs_to_group[i]]
         end
 
-    elseif type == :ds # (Zd * A * Zs' + Zs * A * Zd') * u
-        # Del 1: Zd * A * Zs' * u
+    elseif type == :ds # (Zd * A * Zs_ψ' + Zs_ψ * A * Zd') * u
+        # Del 1: Zd * A * Zs_ψ' * u
         fill!(ws.tmp_N1, 0.0)
-        apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum)
+        apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum, model.group_scale)
         apply_A!(ws.tmp_N2, model.L_Ainv, ws.tmp_N1, ws.tmp_N3)
         for i in 1:n
             @inbounds out[i] = ws.tmp_N2[gs.obs_to_id[i]]
@@ -694,10 +770,10 @@ function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws:
             @inbounds ws.tmp_N1[gs.obs_to_id[i]] += u_n[i]
         end
         apply_A!(ws.tmp_N2, model.L_Ainv, ws.tmp_N1, ws.tmp_N3)
-        # out[i] += (Σ_{bid ∈ g(i)} tmp_N2[bid]) - tmp_N2[obs_to_id[i]]
+        # out[i] += c_{g(i)} * ((Σ_{bid ∈ g(i)} tmp_N2[bid]) - tmp_N2[obs_to_id[i]])
         compute_group_sums!(ws.group_sum, ws.tmp_N2, gs.members_id)
         @inbounds for (i, tid) in enumerate(gs.obs_to_id)
-            out[i] += ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]
+            out[i] += (ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]) * model.group_scale[gs.obs_to_group[i]]
         end
 
     else # :e
@@ -911,6 +987,7 @@ struct AiRemlResult
     k::Int                     # Antall Hutchinson-prober
     # Mapping: obs → stamtavle-ID (for å koble BLUP til individer)
     obs_to_id::Vector{Int}
+    ψ::Float64                 # Dilution exponent used for this fit
 end
 
 function save_results(result::AiRemlResult, filename::String)
@@ -995,12 +1072,15 @@ function get_diag_preconditioner(model::SGEModel)
     @. d[nf+1:nf+N] = diag_ZdZd + diag_Ainv * λ_dd
 
     # 3. Sosial genetikk: diag(Zs'Zs) + Ainv * λ_ss
+    # diag(Zs'Zs)[bid] = o_g - is_observed[bid]   for bid ∈ members_g, m_g >= 2
     diag_ZsZs = @view d[nf+N+1:nf+2N]
-    for members in gs.members_id
-        ng = length(members)
-        if ng > 1
+    for g in eachindex(gs.members_id)
+        members = gs.members_id[g]
+        if length(members) > 1
+            o_g = gs.obs_count_per_group[g]
+            c2_g = model.group_scale[g]^2
             for id in members
-                @inbounds diag_ZsZs[id] += ng - 1
+                @inbounds diag_ZsZs[id] += (o_g - (gs.is_observed[id] ? 1 : 0)) * c2_g
             end
         end
     end
@@ -1281,7 +1361,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
         beta, a_d, a_s, c_env,
         AI, se_final,
         conv_crit < 1e-5, last_iter, n, N, k,
-        copy(model.groups.obs_to_id)
+        copy(model.groups.obs_to_id), model.ψ
     )
     return result
 end

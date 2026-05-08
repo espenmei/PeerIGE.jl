@@ -20,7 +20,7 @@ set.seed(080318)
 library(Matrix)
 library(tidyverse)
 
-ng      = 5000L              # number of genetic groups (families)
+ng      = as.integer(Sys.getenv("SIM_NG", "5000"))  # number of genetic groups (families)
 nper    = 4L                  # individuals per genetic group
 nstudent = ng * nper          # total individuals
 
@@ -33,10 +33,10 @@ Astruc = matrix(c(1/1, 1/2, 1/8, 1/8,
 # --- Variance components (direct + indirect + shared env) ---
 vc_student = matrix(c(1.0, 0.1,
                       0.1, 0.1), 2, 2)
-s2_household = 0.5                       # household (sibling-pair) variance
+s2_household = 0.3                       # household (sibling-pair) variance
 s2_classroom = 0.3                       # classroom shared environment variance
-s2_school = 0.2                          # school shared environment variance
-s2_e = 1.2                              # residual variance
+s2_school = 0.1                          # school shared environment variance
+s2_e = 1.2                               # residual variance
 
 # --- 1. Simulate genetic effects using block structure ---
 # V = vc_student b
@@ -192,9 +192,6 @@ roster = data.frame(id_ped = seq_len(nstudent), group = class)
 
 write_csv(obs_table, "yX_obs.csv")
 write_csv(roster, "roster.csv")
-
-# Legacy output retained for backward compatibility.
-write_csv(datao, "yX.csv")
 cat(sprintf(
   "True variances: household=%.2f classroom=%.2f school=%.2f | n_households=%d n_classrooms=%d n_schools=%d\n",
   s2_household, s2_classroom, s2_school,

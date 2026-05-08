@@ -85,7 +85,7 @@ model1 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)
 
 @time result1 = run_aireml(
     model1,
-    max_iter=20,
+    max_iter=25,
     k=20,
     damping=0.2,
     cg_maxiter=5000,

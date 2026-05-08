@@ -14,9 +14,9 @@ println("Julia threads: $(Threads.nthreads())")
 println("="^70)
 
 # --- Load data ---
-yX = DataFrame(CSV.File("yX.csv"))
-X_df = DataFrame(CSV.File("X.csv"))
-obs = load_observed_data(yX; X_df=X_df)
+obs_table = DataFrame(CSV.File("yX_obs.csv"))
+roster = DataFrame(CSV.File("roster.csv"))
+obs = load_observed_data(obs_table; covariate_cols=[:x])
 X = obs.X
 y = obs.y
 n = length(y); nf = size(X, 2)
@@ -30,8 +30,8 @@ N_ped = size(Ainv, 1)
 L_Ainv_df = DataFrame(CSV.File("LAinv_triplet.csv"))
 L_Ainv = LowerTriangular(sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"])))
 
-gs = build_group_structure(yX, N_ped, obs.obs_mask)
-has_env = "household" in names(yX)
+gs = build_group_structure(obs_table, roster, N_ped)
+has_env = "household" in names(obs_table)
 
 # Use H=0 model (simpler, fewer confounders)
 model = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.1, 0.1, 2.0)

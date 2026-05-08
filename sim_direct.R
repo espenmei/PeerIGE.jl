@@ -137,8 +137,5 @@ roster = data.frame(id_ped = seq_len(nstudent), group = class)
 write_csv(obs_table, "yX_obs.csv")
 write_csv(roster, "roster.csv")
 
-# Legacy output retained for backward compatibility.
-write_csv(datao, "yX.csv")
-
 cat(sprintf("Ferdig! N = %d, n = %d, nclass = %d\n", nstudent, nstudent, nclass))
 cat(sprintf("Forventet: sigma2_d = %.4f, sigma2_e = %.4f\n", sigma2_d, sigma2_e))

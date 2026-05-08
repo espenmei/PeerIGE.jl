@@ -1,1 +1,5 @@
 include("smoke_emai.jl")
+include("test_operator_identity.jl")
+include("test_psi_dilution.jl")
+include("test_dilution_recovery.jl")
+include("test_parameter_recovery.jl")

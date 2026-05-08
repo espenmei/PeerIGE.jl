@@ -20,7 +20,7 @@ set.seed(080318)
 library(Matrix)
 library(tidyverse)
 
-ng      = 5000L              # number of genetic groups (families)
+ng      = 15000L              # number of genetic groups (families)
 nper    = 4L                  # individuals per genetic group
 nstudent = ng * nper          # total individuals
 
@@ -142,15 +142,20 @@ write_csv(Ainv_triplet,  "Ainv_triplet.csv")
 write_csv(LAinv_triplet, "LAinv_triplet.csv")
 
 # --- 4. Output data ---
-# Master table: all individuals as rows; ~10% have missing y to simulate
-# group members without observed outcomes.
+# Master table: all individuals as rows; SIM_MISSING_FRAC controls fraction of
+# individuals whose y is set to NA (peers without observed outcome).
+# Default 0.0 keeps every outcome (validation-friendly recovery).
 datao = data.frame(y = y_obs, x = x2, group = class, id_ped = seq_len(nstudent))
+missing_frac = as.numeric(Sys.getenv("SIM_MISSING_FRAC", "0.0"))
+stopifnot(missing_frac >= 0, missing_frac < 1)
 set.seed(42)
-n_missing = round(0.10 * nstudent)
-missing_idx = sample.int(nstudent, n_missing)
-datao$y[missing_idx] = NA_real_
-message(sprintf("Master yX table: %d total rows, %d observed, %d missing",
-                nstudent, nstudent - n_missing, n_missing))
+n_missing = round(missing_frac * nstudent)
+if (n_missing > 0) {
+  missing_idx = sample.int(nstudent, n_missing)
+  datao$y[missing_idx] = NA_real_
+}
+message(sprintf("Master yX table: %d total rows, %d observed, %d missing (frac=%.2f)",
+                nstudent, nstudent - n_missing, n_missing, missing_frac))
 
 # New two-table contract:
 # 1) observed table for REML response/design and env mappings
@@ -160,9 +165,3 @@ roster = data.frame(id_ped = seq_len(nstudent), group = class)
 
 write_csv(obs_table, "yX_obs.csv")
 write_csv(roster, "roster.csv")
-
-# Legacy output retained for backward compatibility.
-write_csv(datao, "yX.csv", na = "")
-
-X = model.matrix(~ 1 + x2, data = datao)
-write_csv(as.data.frame(X), "X.csv")

@@ -1,5 +1,5 @@
 using DataFrames
-include("emai.jl")
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 
 function validate_case(df, case_name)
     println("--- Case: $case_name ---")

@@ -1,6 +1,6 @@
 # Parameter recovery test on a dedicated zero-environment dataset.
 if !@isdefined(SGEModel)
-    include(joinpath(@__DIR__, "..", "emai.jl"))
+    include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 end
 using Printf
 

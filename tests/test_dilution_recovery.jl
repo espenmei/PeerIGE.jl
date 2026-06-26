@@ -1,6 +1,6 @@
 # Conditional parameter recovery test for dilution parameter ψ.
 if !@isdefined(SGEModel)
-    include(joinpath(@__DIR__, "..", "emai.jl"))
+    include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 end
 using Printf
 

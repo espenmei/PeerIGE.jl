@@ -10,7 +10,7 @@ Use short, bounded development cycles:
 4. Implement one focused change
 5. Run a representative verification step immediately
 
-This project is numerically sensitive. Avoid broad cleanup passes across `emai.jl` unless the goal is explicitly modularization.
+This project is numerically sensitive. Avoid broad cleanup passes across `src/emai*.jl` unless the goal is explicitly modularization.
 
 ## Standard Run Command
 
@@ -32,9 +32,7 @@ Pkg.activate(".")
 The main execution entry points are:
 
 - `run_emai.jl`: runnable script with explicit data loading, model setup, and solver arguments
-- `run_aireml(model; ...)` in `emai.jl`: core outer optimization loop once a model is already constructed
-- `run_emai_direct.jl`: runnable script for the direct-effects baseline
-- `run_emai_direct(; ...)` in `emai_direct.jl`: reusable helper for the direct model workflow
+- `run_aireml(model; ...)` in `src/emai_aireml.jl`: core outer optimization loop once a model is already constructed
 
 Parameters worth tuning carefully:
 

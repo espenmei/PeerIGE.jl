@@ -4,12 +4,10 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## What This Repository Contains
 
-- `emai.jl`: full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects (`σ2_env` for 0–2 grouping factors)
+- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators, preconditioners), `src/emai_trace.jl` (Hutchinson trace probes), and `src/emai_aireml.jl` (score/AI assembly and the `run_aireml` driver). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects (`σ2_env` for 0–2 grouping factors)
 - `run_emai.jl`: runnable entrypoint; fits both the base SGE model and the SGE+household model, prints a comparison table
-- `emai_direct.jl`: simpler direct-effects-only baseline
-- `run_emai_direct.jl`: runnable entrypoint for the direct-effects baseline
 - `computational_approach.md`: math and algorithm overview
-- `sim_peer.R`, `sim_peer_evn.R`, `sim_direct.R`: simulation scripts in R (`sim_peer_evn.R` adds household/classroom/school shared environment effects); each writes the two-table format (`yX_obs.csv`, `roster.csv`)
+- `sim/`: simulation scripts in R (`sim_peer.R`, `sim_peer_evn.R`; `sim_peer_evn.R` adds household/classroom/school shared environment effects); each writes the two-table format (`yX_obs.csv`, `roster.csv`)
 - `yX_obs.csv`: observed-only rows — one row per observed outcome, with columns `y`, `id_ped`, covariates, and optional environment IDs (e.g. `household`)
 - `roster.csv`: full social group membership for all relevant pedigree IDs, with columns `id_ped` and `group` (includes unobserved animals)
 - `Ainv_triplet.csv`, `LAinv_triplet.csv`: sparse pedigree matrix inputs in triplet format
@@ -18,13 +16,14 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## Folder Structure
 
+- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_mme.jl`, `emai_trace.jl`, `emai_aireml.jl`)
+- `sim`: R simulation scripts that generate the input CSVs
 - `outputs/logs`: AI-REML and benchmark log CSVs
 - `outputs/results`: JLD2 model result files
 - `outputs/benchmarks`: benchmark CSV logs
 - `outputs/smoke`: smoke-test logs
 - `tests`: test scripts and the main test entrypoint (`runtests.jl`)
 - `diagnostics`: one-off diagnostic scripts (`diag_*.jl`)
-- `docs`: rendered HTML documentation artifacts (`computational_approach.html` and assets)
 
 ## Environment
 
@@ -42,12 +41,6 @@ Run the full model with:
 
 ```powershell
 julia --project=. run_emai.jl
-```
-
-Run the direct-effects baseline with:
-
-```powershell
-julia --project=. run_emai_direct.jl
 ```
 
 Run the test entrypoint after code changes with:

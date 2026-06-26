@@ -1,4 +1,4 @@
-include("../emai.jl")
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 using CSV, DataFrames, SparseArrays, LinearAlgebra, Printf
 
 const TRUTH = (σ2_d=1.0, σ2_s=0.1, σ_ds=0.1, σ2_e=1.5625)

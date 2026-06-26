@@ -1,4 +1,4 @@
-include("emai.jl")
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 
 # Focused diagnostic for compute_score_and_ai:
 # 1. Checks if workspace creation affects sequential results

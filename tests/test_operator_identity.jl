@@ -1,4 +1,4 @@
-include(joinpath(@__DIR__, "..", "emai.jl"))
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 using LinearAlgebra, SparseArrays, Random, Test, Printf
 
 # Small dense reference for the matrix-free MMEOperator and Z_s'Z_s contraction.

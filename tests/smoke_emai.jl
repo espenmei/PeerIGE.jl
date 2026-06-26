@@ -1,4 +1,4 @@
-include(joinpath(@__DIR__, "..", "emai.jl"))
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 
 println("[Smoke test] Running quick SGE model verification...")
 

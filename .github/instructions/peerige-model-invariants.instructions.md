@@ -1,7 +1,7 @@
 ---
-description: "Use when modifying PeerIGE.jl model code, AI-REML updates, social design logic, missing-response handling, shared environment effects, or tests for emai.jl and related Julia files. Summarizes non-negotiable mathematical invariants from computational_approach.md."
+description: "Use when modifying PeerIGE.jl model code, AI-REML updates, social design logic, missing-response handling, shared environment effects, or tests for src/emai*.jl and related Julia files. Summarizes non-negotiable mathematical invariants from computational_approach.md."
 name: "PeerIGE Model Invariants"
-applyTo: "emai*.jl, run_emai*.jl, tests/**/*.jl"
+applyTo: "src/emai*.jl, run_emai*.jl, tests/**/*.jl"
 ---
 
 # PeerIGE Model Invariants

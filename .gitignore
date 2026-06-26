@@ -15,3 +15,31 @@ Manifest.toml
 # Generated folders
 outputs/
 docs/computational_approach_files/
+
+# Direct-effects baseline (kept local, not published)
+emai_direct.jl
+run_emai_direct.jl
+
+# Manuscripts, slides, outlines, roadmap — kept local, not published
+ROADMAP.md
+peer_ige_outline.md
+slides.qmd
+*DePeer*
+*.docx
+~$*
+articles/
+BGA_2026/
+
+# Rendered-doc asset folders and figures
+*_files/
+covariance_illustration.pdf
+covariance_illustration.png
+
+# Runtime logs / validation output
+log.txt
+output_validation.txt
+*.log
+
+# Editor / local
+.vscode/
+sim/_extract_docx.R

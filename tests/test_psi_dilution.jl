@@ -1,4 +1,4 @@
-include(joinpath(@__DIR__, "..", "emai.jl"))
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 
 println("[psi-dilution] Running dilution parameter ψ tests...")
 

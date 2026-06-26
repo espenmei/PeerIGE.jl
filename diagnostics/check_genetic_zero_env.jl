@@ -1,4 +1,4 @@
-include("../emai.jl")
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 using Printf
 using CSV, DataFrames, SparseArrays, LinearAlgebra
 

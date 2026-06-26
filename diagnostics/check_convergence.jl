@@ -1,4 +1,4 @@
-include("../emai.jl")
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 using CSV, DataFrames, SparseArrays, LinearAlgebra, Printf
 
 obs_table = DataFrame(CSV.File("yX_obs.csv"))

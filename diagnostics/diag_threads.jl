@@ -1,4 +1,4 @@
-include("emai.jl")
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 
 println("="^70)
 println("THREADING DIAGNOSTIC")

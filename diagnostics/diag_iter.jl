@@ -1,4 +1,4 @@
-include("emai.jl")
+include(joinpath(@__DIR__, "..", "src", "emai.jl"))
 
 # Single-iteration comparison: runs ONE AI-REML iteration both sequential and
 # threaded, printing intermediate values to find where they first diverge.

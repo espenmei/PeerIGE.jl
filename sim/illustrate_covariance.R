@@ -60,16 +60,16 @@ A <- A_full[pen_rows, pen_rows]
 # ── Z matrix (pen-mate incidence) ────────────────────────────────────────────
 # pens defined by original row indices; external founders (1:4) excluded
 pens <- list(c(5, 6, 7), c(8, 9, 10), c(11, 12, 13, 14))
-Z_full <- matrix(0, n_ped, n_ped)
+Zs_full <- matrix(0, n_ped, n_ped)
 for (pen in pens) {
-  for (i in pen) for (j in pen) if (i != j) Z_full[i, j] <- 1
+  for (i in pen) for (j in pen) if (i != j) Zs_full[i, j] <- 1
 }
 
-ZZt_full  <- Z_full %*% t(Z_full)
-ZAZt_full <- Z_full %*% A_full %*% t(Z_full)
+ZsZst_full  <- Zs_full %*% t(Zs_full)
+ZsAZst_full <- Zs_full %*% A_full %*% t(Zs_full)
 
-ZZt  <- ZZt_full[pen_rows,  pen_rows]
-ZAZt <- ZAZt_full[pen_rows, pen_rows]
+ZsZst  <- ZsZst_full[pen_rows,  pen_rows]
+ZsAZst <- ZsAZst_full[pen_rows, pen_rows]
 
 # ── Plotting ─────────────────────────────────────────────────────────────────
 plot_mat <- function(mat, title) {
@@ -77,7 +77,7 @@ plot_mat <- function(mat, title) {
   # matrix reads top-to-bottom as expected.
   image(1:n, 1:n, t(mat[n:1, ]),
         col  = hcl.colors(64, "YlOrRd", rev = TRUE),
-        zlim = c(0, max(ZAZt)),
+        zlim = c(0, max(ZsAZst)),
         xlab = "", ylab = "", axes = FALSE,
         main = title)
   axis(1, at = 1:n, labels = 1:n, cex.axis = 0.8, tick = FALSE)
@@ -91,8 +91,8 @@ plot_mat <- function(mat, title) {
 png("covariance_illustration.png", width = 1600, height = 600, res = 150)
   par(mfrow = c(1, 3), mar = c(2, 2, 3, 1), oma = c(0, 0, 3, 0))
   plot_mat(A,    expression(bold(A)))
-  plot_mat(ZZt,  expression(bold(ZZ)*"'"))
-  plot_mat(ZAZt, expression(bold(ZAZ)*"'"))
+  plot_mat(ZsZst,  expression(bold(Z[s]*Z[s])*"'"))
+  plot_mat(ZsAZst, expression(bold(Z[s]*A*Z[s])*"'"))
   mtext("Covariance structures in social genetic effects models",
         outer = TRUE, cex = 1.1, font = 2)
 dev.off()
@@ -100,8 +100,8 @@ dev.off()
 pdf("covariance_illustration.pdf", width = 12, height = 4.5)
   par(mfrow = c(1, 3), mar = c(2, 2, 3, 1), oma = c(0, 0, 3, 0))
   plot_mat(A,    expression(bold(A)))
-  plot_mat(ZZt,  expression(bold(ZZ)*"'"))
-  plot_mat(ZAZt, expression(bold(ZAZ)*"'"))
+  plot_mat(ZsZst,  expression(bold(Z[s]*Z[s])*"'"))
+  plot_mat(ZsAZst, expression(bold(Z[s]*A*Z[s])*"'"))
   mtext("Covariance structures in social genetic effects models",
         outer = TRUE, cex = 1.1, font = 2)
 dev.off()

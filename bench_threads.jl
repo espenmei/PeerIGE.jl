@@ -1,4 +1,4 @@
-include("emai.jl")
+include(joinpath(@__DIR__, "src", "emai.jl"))
 
 const OUT_BENCH_DIR = joinpath("outputs", "benchmarks")
 mkpath(OUT_BENCH_DIR)

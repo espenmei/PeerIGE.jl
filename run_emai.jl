@@ -1,4 +1,4 @@
-include("emai.jl")
+include(joinpath(@__DIR__, "src", "emai.jl"))
 
 const OUT_LOG_DIR = joinpath("outputs", "logs")
 const OUT_RES_DIR = joinpath("outputs", "results")

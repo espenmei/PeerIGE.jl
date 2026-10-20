@@ -3,58 +3,43 @@
 # Score and Average Information assembly, parameter updates, the result
 # struct, and the run_aireml iteration loop. Included via emai.jl.
 # =====================================================================
-# Returnerer varianstype-symboler for gjeldende modell (:d, :s, :ds, :e, :env1, :env2, ...)
-function get_variance_types(model::SGEModel)
-    types = Symbol[:d, :s, :ds, :e]
+# Returnerer varianstype-representasjon for gjeldende modell (d, s, ds, e, env_h)
+function get_variance_components(model::SGEModel)
+    comps = VarianceComponent[
+        VarianceComponent(VC_D, 0),
+        VarianceComponent(VC_S, 0),
+        VarianceComponent(VC_DS, 0),
+        VarianceComponent(VC_E, 0)
+    ]
     for h in 1:length(model.env_ids)
-        push!(types, Symbol(:env, h))
+        push!(comps, VarianceComponent(VC_ENV, h))
     end
-    return types
+    return comps
 end
 
 function compute_score_and_ai(model::SGEModel, Py, z_list, Pz_list, workspaces, preconditioners;
     ai_reltol=1e-5, ai_maxiter=500)
-    types = get_variance_types(model)
-    n_p = length(types)
+    comps = get_variance_components(model)
+    n_p = length(comps)
     score = zeros(n_p)
     AI = zeros(n_p, n_p)
     k = length(Pz_list)
     n = length(Py)
-    use_threads = length(workspaces) > 1 && Threads.nthreads() > 1
 
     # 1. Forhåndsberegn alle Vi * Py
     println("    -> Beregner Vi * Py...")
     Vi_Py_list = [Vector{Float64}(undef, n) for _ in 1:n_p]
-    if use_threads
-        _threaded_vi_py!(Vi_Py_list, Py, types, model, workspaces)
-    else
-        ws = workspaces[1]
-        for i in 1:n_p
-            get_Vi_u!(Vi_Py_list[i], Py, types[i], model, ws)
-        end
-    end
+    _threaded_vi_py!(Vi_Py_list, Py, comps, model, workspaces)
 
     # 2. SCORE: s_i = 0.5 * (y'P * Vi * Py - tr(P * Vi))
     #    Trace-estimering: parallelliser k get_Vi_u-kall per parameter
     println("    -> Beregner trace (k=$k)...")
-    if use_threads
-        n_trace = n_p * k
-        trace_results = zeros(n_trace)
-        _threaded_trace!(trace_results, n_trace, k, Pz_list, z_list, types, model, workspaces)
-        for i in 1:n_p
-            tr_val = sum(@view trace_results[(i-1)*k+1 : i*k])
-            score[i] = 0.5 * (Py' * Vi_Py_list[i] - tr_val)
-        end
-    else
-        ws = workspaces[1]
-        for i in 1:n_p
-            tr_val = 0.0
-            for j in 1:k
-                get_Vi_u!(ws.vi_out, Pz_list[j], types[i], model, ws)
-                @inbounds tr_val += dot(z_list[j], ws.vi_out) / k
-            end
-            score[i] = 0.5 * (Py' * Vi_Py_list[i] - tr_val)
-        end
+    n_trace = n_p * k
+    trace_results = zeros(n_trace)
+    _threaded_trace!(trace_results, n_trace, k, Pz_list, z_list, comps, model, workspaces)
+    for i in 1:n_p
+        tr_val = sum(@view trace_results[(i-1)*k+1 : i*k])
+        score[i] = 0.5 * (Py' * Vi_Py_list[i] - tr_val)
     end
 
     # 3. AI-MATRISE (Average Information)
@@ -64,57 +49,36 @@ function compute_score_and_ai(model::SGEModel, Py, z_list, Pz_list, workspaces, 
 
     # Steg 1: Beregn P * V_j * Py
     P_Vi_Py_list = [Vector{Float64}(undef, n) for _ in 1:n_p]
-    if use_threads
-        _threaded_ai_cg!(P_Vi_Py_list, Vi_Py_list, model, workspaces, preconditioners, ai_reltol, ai_maxiter)
-    else
-        ws = workspaces[1]
-        tmp_sol = zeros(length(model.sol_y))
-        for j in 1:n_p
-            copyto!(tmp_sol, model.sol_y)
-            solve_mme_direct!(tmp_sol, model, Vi_Py_list[j], ws, preconditioners[1],
-                reltol=ai_reltol, maxiter=ai_maxiter)
-            compute_Px_from_sol!(P_Vi_Py_list[j], model, Vi_Py_list[j], tmp_sol, ws)
-        end
-    end
+    _threaded_ai_cg!(P_Vi_Py_list, Vi_Py_list, model, workspaces, preconditioners, ai_reltol, ai_maxiter)
 
     # Steg 2: Beregn AI[i,j] = 0.5 * Py' * Vi * P * Vj * Py  (billige mat-vec)
     pairs = [(i, j) for i in 1:n_p for j in 1:i]
-    if use_threads
-        ai_vals = zeros(length(pairs))
-        _threaded_ai_matvec!(ai_vals, pairs, P_Vi_Py_list, Py, types, model, workspaces)
-        for (idx, (i_idx, j_idx)) in enumerate(pairs)
-            AI[i_idx, j_idx] = ai_vals[idx]
-            AI[j_idx, i_idx] = ai_vals[idx]
-        end
-    else
-        ws = workspaces[1]
-        for (i_idx, j_idx) in pairs
-            get_Vi_u!(ws.vi_out, P_Vi_Py_list[j_idx], types[i_idx], model, ws)
-            val = 0.5 * dot(Py, ws.vi_out)
-            AI[i_idx, j_idx] = val
-            AI[j_idx, i_idx] = val
-        end
+    ai_vals = zeros(length(pairs))
+    _threaded_ai_matvec!(ai_vals, pairs, P_Vi_Py_list, Py, comps, model, workspaces)
+    for (idx, (i_idx, j_idx)) in enumerate(pairs)
+        AI[i_idx, j_idx] = ai_vals[idx]
+        AI[j_idx, i_idx] = ai_vals[idx]
     end
     return score, AI
 end
 
 # --- Helper functions: each wraps a single @threads block to isolate closures ---
 
-function _threaded_vi_py!(Vi_Py_list, Py, types, model, workspaces)
-    n_p = length(types)
+function _threaded_vi_py!(Vi_Py_list, Py, comps, model, workspaces)
+    n_p = length(comps)
     Threads.@threads :static for i in 1:n_p
         tid = Threads.threadid()
-        get_Vi_u!(Vi_Py_list[i], Py, types[i], model, workspaces[tid])
+        get_Vi_u!(Vi_Py_list[i], Py, comps[i], model, workspaces[tid])
     end
 end
 
-function _threaded_trace!(trace_results, n_trace, k, Pz_list, z_list, types, model, workspaces)
+function _threaded_trace!(trace_results, n_trace, k, Pz_list, z_list, comps, model, workspaces)
     Threads.@threads :static for flat_idx in 1:n_trace
         tid = Threads.threadid()
         ws = workspaces[tid]
         i = (flat_idx - 1) ÷ k + 1
         j = (flat_idx - 1) % k + 1
-        get_Vi_u!(ws.vi_out, Pz_list[j], types[i], model, ws)
+        get_Vi_u!(ws.vi_out, Pz_list[j], comps[i], model, ws)
         trace_results[flat_idx] = dot(z_list[j], ws.vi_out) / k
     end
 end
@@ -131,12 +95,12 @@ function _threaded_ai_cg!(P_Vi_Py_list, Vi_Py_list, model, workspaces, precondit
     end
 end
 
-function _threaded_ai_matvec!(ai_vals, pairs, P_Vi_Py_list, Py, types, model, workspaces)
+function _threaded_ai_matvec!(ai_vals, pairs, P_Vi_Py_list, Py, comps, model, workspaces)
     Threads.@threads :static for idx in eachindex(pairs)
         tid = Threads.threadid()
         ws = workspaces[tid]
         i_idx, j_idx = pairs[idx]
-        get_Vi_u!(ws.vi_out, P_Vi_Py_list[j_idx], types[i_idx], model, ws)
+        get_Vi_u!(ws.vi_out, P_Vi_Py_list[j_idx], comps[i_idx], model, ws)
         ai_vals[idx] = 0.5 * dot(Py, ws.vi_out)
     end
 end
@@ -211,18 +175,27 @@ function update_params!(model::SGEModel, delta, damping)
     end
 end
 
+# Draw k fixed Gaussian probe vectors z_j ∈ ℝⁿ for the Hutchinson trace
+# estimator tr(P*V_i) ≈ (1/k) Σ_j z_j' (V_i (P z_j)). Seeding here keeps the
+# probes deterministic and identical across every iteration of run_aireml,
+# which is required for the trace estimate to be comparable between iterations.
+function make_trace_probes(n::Int, k::Int; seed::Int=42)
+    Random.seed!(seed)
+    return [randn(n) for _ in 1:k]
+end
+
 function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     cg_maxiter=2000, cg_reltol=1e-7,
     cg_reltol_early=1e-5, cg_early_iters=3,
     ai_maxiter=500, ai_reltol=1e-5,
     use_block_precond=true, verbose_cg=true,
-    threaded=true, log_file::String="",
+    log_file::String="",
     seed::Int=42)
     n = length(model.y)
+    N = size(model.Ainv, 1)
     dim = length(model.sol_y)
     H = length(model.env_ids)
-    types = get_variance_types(model)
-    n_p = length(types)
+    n_p = 4 + H
     param_names = ["σ²_d", "σ²_s", "σ_ds", "σ²_e"]
     for h in 1:H
         push!(param_names, "σ²_env$h")
@@ -230,31 +203,23 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
 
     nt = Threads.nthreads()
     max_tid = Threads.maxthreadid()   # Julia 1.12: threadid() kan returnere > nthreads()
-    use_threads = threaded && nt > 1
 
     # Allokere sol_z til riktig størrelse for denne kjøringen
     model.sol_z = [zeros(dim) for _ in 1:k]
 
     # Vi må bruke de SAMME z-vektorene i hver iterasjon
-    # for at Hutchinson-estimatet skal være sammenlignbart (se emai_trace.jl)
+    # for at Hutchinson-estimatet skal være sammenlignbart (se make_trace_probes)
     z_fixed_list = make_trace_probes(n, k; seed=seed)
 
     # Preallokkerte buffere for Px-beregninger (gjenbrukes per iterasjon)
     Py = Vector{Float64}(undef, n)
     Pz_list = [Vector{Float64}(undef, n) for _ in 1:k]
 
-    # Workspaces for CG-solves og trace-estimering
-    # Sekvensiell: ett workspace som aliaser modellens buffere
-    # Parallell: ett workspace per tråd (indeksert med threadid())
-    if use_threads
-        workspaces = create_thread_workspaces(model, max_tid)
-    else
-        workspaces = [model_workspace(model)]
-    end
+    # Workspaces for CG-solves og trace-estimering: ett per tråd (indeksert med threadid())
+    workspaces = create_thread_workspaces(model, max_tid)
 
     precond_name = use_block_precond ? "Block" : "Diag"
-    thread_info = use_threads ? ", threads=$nt" : ""
-    println("Starter AI-REML: k=$k, damping=$damping, precond=$precond_name, cg_maxiter=$cg_maxiter$thread_info")
+    println("Starter AI-REML: k=$k, damping=$damping, precond=$precond_name, cg_maxiter=$cg_maxiter, threads=$nt")
     println("CG reltol schedule: early=$cg_reltol_early (iter <= $cg_early_iters), late=$cg_reltol")
     println("N=$( size(model.Ainv,1)), n=$n, dim=$dim")
     println("-"^70)
@@ -289,11 +254,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
         if use_block_precond
             preconditioners = [get_preconditioner(model, ws) for ws in workspaces]
         else
-            if use_threads
-                preconditioners = fill(get_diag_preconditioner(model), length(workspaces))
-            else
-                preconditioners = [get_diag_preconditioner(model)]
-            end
+            preconditioners = fill(get_diag_preconditioner(model), length(workspaces))
         end
 
         # 1. Oppdater modellens egne løsninger (Warm Start) — y-solve er sekvensiell
@@ -304,21 +265,12 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
 
         # 2. Parallelliser k z-solves
         if verbose_cg
-            @printf("    Z-solves: k=%d %s...\n", k, use_threads ? "(threaded)" : "")
+            @printf("    Z-solves: k=%d (threaded)...\n", k)
             flush(stdout)
         end
         t_z = @elapsed begin
-            if use_threads
-                _threaded_z_solves!(model, z_fixed_list, Pz_list, workspaces, preconditioners,
-                    k, iter_cg_reltol, cg_maxiter)
-            else
-                ws = workspaces[1]
-                for i in 1:k
-                    solve_mme_z!(model.sol_z[i], model, z_fixed_list[i], ws, preconditioners[1],
-                        reltol=iter_cg_reltol, maxiter=cg_maxiter, verbose=(verbose_cg && i == 1))
-                    compute_Px_from_sol!(Pz_list[i], model, z_fixed_list[i], model.sol_z[i], ws)
-                end
-            end
+            _threaded_z_solves!(model, z_fixed_list, Pz_list, workspaces, preconditioners,
+                k, iter_cg_reltol, cg_maxiter)
         end
         if verbose_cg
             @printf("    Z-solves ferdig: %.1fs\n", t_z)
@@ -446,19 +398,15 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     solve_mme_y!(model, workspaces[1], final_precond, reltol=cg_reltol, maxiter=cg_maxiter, verbose=verbose_cg)
 
     # Pakk ut BLUE/BLUP fra løsningsvektoren
-    nf = size(model.X, 2)
-    N = size(model.Ainv, 1)
-    beta = model.sol_y[1:nf]
-    a_d = model.sol_y[nf+1:nf+N]
-    a_s = model.sol_y[nf+N+1:nf+2N]
+    lay = model.layout
+    beta = model.sol_y[lay.fixed]
+    a_d = model.sol_y[lay.direct]
+    a_s = model.sol_y[lay.social]
 
     # Env BLUPs
     c_env = Vector{Float64}[]
-    env_offset = nf + 2N
     for h in 1:H
-        n_h = model.env_n_levels[h]
-        push!(c_env, model.sol_y[env_offset+1:env_offset+n_h])
-        env_offset += n_h
+        push!(c_env, model.sol_y[lay.env[h]])
     end
 
     # Beregn endelig AI og SE

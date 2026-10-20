@@ -36,7 +36,7 @@ for tag in FRACS
     m = SGEModel(y, X, Ainv, LA, gs, 1.0, 0.2, 0.0, 2.0)
     r = run_aireml(m; max_iter=30, k=20, damping=0.5,
         cg_maxiter=5000, cg_reltol_early=1e-5, cg_early_iters=4,
-        cg_reltol=1e-7, threaded=true, verbose_cg=false)
+        cg_reltol=1e-7, verbose_cg=false)
 
     push!(results, (tag, length(y), m.σ2_d, m.σ2_s, m.σ_ds, m.σ2_e,
         r.converged, r.n_iter))

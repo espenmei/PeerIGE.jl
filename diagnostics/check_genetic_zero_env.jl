@@ -50,7 +50,6 @@ result = run_aireml(
     cg_reltol_early=1e-5,
     cg_early_iters=4,
     cg_reltol=1e-7,
-    threaded=true,
 )
 
 truth = Dict(

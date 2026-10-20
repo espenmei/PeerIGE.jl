@@ -1,84 +1,9 @@
 # =====================================================================
 # CORE TYPES & DATA CONSTRUCTION
-# Shared structs (preconditioners, GroupStructure, SGEModel, ThreadWorkspace)
-# and observed-data / group-structure builders used by the MME and AI-REML
-# layers. Included via emai.jl.
+# Shared structs (GroupStructure, SGEModel, ThreadWorkspace) and the
+# observed-data / group-structure builders used by the MME and AI-REML
+# layers. Preconditioners live in emai_precond.jl. Included via emai.jl.
 # =====================================================================
-# Rask diagonal preconditioner — unngår findfirst zero-sjekk i standard Diagonal ldiv!
-# OG fikser bug: Diagonal(1/d) + ldiv! ga z=r*d (feil retning).
-# DiagPreconditioner lagrer 1/d og gjør z=x*(1/d), som er korrekt M^{-1}*r.
-struct DiagPreconditioner
-    inv_diag::Vector{Float64}
-end
-
-function ldiv!(y::AbstractVector, P::DiagPreconditioner, x::AbstractVector)
-    d = P.inv_diag
-    @inbounds @simd for i in eachindex(y, x, d)
-        y[i] = d[i] * x[i]
-    end
-    return y
-end
-
-# Blokk-preconditioner: diag for fixed effects, (G ⊗ A)/σ²_e for genetisk blokk.
-# Fanger ALL off-diagonal struktur i Ainv via Cholesky (4 sparse tri-solves per applikasjon).
-struct BlockPreconditioner
-    diag_f_inv::Vector{Float64}     # 1/diag(X'X), length nf
-    G_over_σ2e::Matrix{Float64}     # G / σ²_e (2×2)
-    L_Ainv::LowerTriangular{Float64,SparseMatrixCSC{Float64,Int64}}
-    nf::Int
-    N::Int
-    tmp1::Vector{Float64}           # workspace (length N)
-    tmp2::Vector{Float64}           # workspace (length N)
-    env_diag_inv::Vector{Vector{Float64}}  # H vectors, 1/(count_j + σ²_e/σ²_h)
-end
-
-function ldiv!(z::AbstractVector, P::BlockPreconditioner, r::AbstractVector)
-    nf, N = P.nf, P.N
-    g11, g12, g21, g22 = P.G_over_σ2e[1, 1], P.G_over_σ2e[1, 2], P.G_over_σ2e[2, 1], P.G_over_σ2e[2, 2]
-    tmp1, tmp2 = P.tmp1, P.tmp2
-
-    # Faste effekter: diagonal
-    @inbounds @simd for i in 1:nf
-        z[i] = P.diag_f_inv[i] * r[i]
-    end
-
-    # A * r_d → tmp2, deretter skriv G-blanding inn i z
-    @inbounds for i in 1:N
-        tmp1[i] = r[nf+i]
-    end
-    ldiv!(P.L_Ainv, tmp1)          # tmp1 = L⁻¹ r_d
-    copyto!(tmp2, tmp1)
-    ldiv!(P.L_Ainv', tmp2)         # tmp2 = A * r_d
-
-    # Fused: skriv G-blend for r_d + kopier r_s inn i tmp1
-    @inbounds @simd for i in 1:N
-        z[nf+i] = g11 * tmp2[i]
-        z[nf+N+i] = g21 * tmp2[i]
-        tmp1[i] = r[nf+N+i]
-    end
-
-    ldiv!(P.L_Ainv, tmp1)
-    copyto!(tmp2, tmp1)
-    ldiv!(P.L_Ainv', tmp2)         # tmp2 = A * r_s
-
-    @inbounds @simd for i in 1:N
-        z[nf+i] += g12 * tmp2[i]
-        z[nf+N+i] += g22 * tmp2[i]
-    end
-
-    # Env blocks: diagonal preconditioner
-    env_offset = nf + 2N
-    for h in eachindex(P.env_diag_inv)
-        dinv = P.env_diag_inv[h]
-        @inbounds @simd for j in eachindex(dinv)
-            z[env_offset+j] = dinv[j] * r[env_offset+j]
-        end
-        env_offset += length(dinv)
-    end
-
-    return z
-end
-
 struct GroupStructure
     members_id::Vector{Vector{Int}} # ID-er i stamtavlen (1..N)
     obs_to_id::Vector{Int}          # Hvilken stamtavle-ID har obs i? (1..n)
@@ -146,6 +71,44 @@ function GroupStructure(group_ids::Vector{Int}, animal_ids::Vector{Int}, N_pedig
         obs_count_per_group, is_observed)
 end
 
+# Blokk-oppsett for løsningsvektoren: [faste (nf) | direkte (N) | sosiale (N) | env1 (n_h1) | env2 ...]
+# Bygges én gang ved modellkonstruksjon; UnitRange-feltene er immutable og allokerer ikke i hot loops.
+struct SolutionLayout
+    nf::Int
+    N::Int
+    fixed::UnitRange{Int}
+    direct::UnitRange{Int}
+    social::UnitRange{Int}
+    env::Vector{UnitRange{Int}}
+    dim::Int
+end
+
+function SolutionLayout(nf::Int, N::Int, env_n_levels::AbstractVector{Int})
+    fixed = 1:nf
+    direct = (nf+1):(nf+N)
+    social = (nf+N+1):(nf+2N)
+    env = Vector{UnitRange{Int}}(undef, length(env_n_levels))
+    off = nf + 2N
+    for (h, n_h) in enumerate(env_n_levels)
+        env[h] = (off+1):(off+n_h)
+        off += n_h
+    end
+    return SolutionLayout(nf, N, fixed, direct, social, env, off)
+end
+
+# Varianskomponent-identifikator brukt i score/AI og Vi*u.
+# Unngår string-parsing av Symbol(:env, h) i hot path.
+const VC_D = UInt8(1)
+const VC_S = UInt8(2)
+const VC_DS = UInt8(3)
+const VC_E = UInt8(4)
+const VC_ENV = UInt8(5)
+
+struct VarianceComponent
+    kind::UInt8
+    env_idx::Int
+end
+
 mutable struct SGEModel
     y::Vector{Float64}
     X::Matrix{Float64}
@@ -164,28 +127,13 @@ mutable struct SGEModel
     # Warm start
     sol_y::Vector{Float64}
     sol_z::Vector{Vector{Float64}} # For Hutchinson trace estimat av Vi * Pz
-    # Preallokkerte workspace-buffere
-    rhs_buffer::Vector{Float64}
-    tmp_N1::Vector{Float64}
-    tmp_N2::Vector{Float64}
-    tmp_N3::Vector{Float64}
-    # MMEOperator workspace (gjenbrukes mellom CG-kall)
-    op_wn::Vector{Float64}    # length n
-    op_wn2::Vector{Float64}   # length n
-    op_wdim::Vector{Float64}  # length dim
-    op_Ad::Vector{Float64}    # length N
-    op_As::Vector{Float64}    # length N
-    op_Ginv::Matrix{Float64}  # 2×2 cached Ginv*σ²_e
     ψ::Float64                # Dilution exponent: social peer sum scaled by (m_g-1)^{-ψ}
     group_scale::Vector{Float64}  # Per-group dilution factor; 1.0 when ψ=0, 0.0 when m_g<=1
+    layout::SolutionLayout    # Blokk-ranges for løsningsvektoren (bygges én gang)
 end
 
 # Beregner total dimensjon for løsningsvektoren
-function get_dim(model::SGEModel)
-    nf = size(model.X, 2)
-    N = size(model.Ainv, 1)
-    return nf + 2N + sum(model.env_n_levels)
-end
+get_dim(model::SGEModel) = model.layout.dim
 
 function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
     env_ids::Vector{Vector{Int}}=Vector{Int}[], σ2_env::Vector{Float64}=Float64[],
@@ -215,24 +163,13 @@ function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
     dim = nf + 2N + sum(env_n_levels)
     sol_y = zeros(dim)
     sol_z = Vector{Vector{Float64}}()  # Allokeres av run_aireml
-    rhs_buffer = zeros(dim)
-    tmp_N1 = zeros(N)
-    tmp_N2 = zeros(N)
-    tmp_N3 = zeros(N)
-    # MMEOperator workspaces (gjenbrukes)
-    op_wn = zeros(n)
-    op_wn2 = zeros(n)
-    op_wdim = zeros(dim)
-    op_Ad = zeros(N)
-    op_As = zeros(N)
-    op_Ginv = zeros(2, 2)
     group_scale = [length(m) <= 1 ? 0.0 : (ψ == 0.0 ? 1.0 : Float64(length(m) - 1)^(-ψ))
                    for m in groups.members_id]
+    layout = SolutionLayout(nf, N, env_n_levels)
     return SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e,
         env_ids, env_n_levels, env_counts, σ2_env,
-        sol_y, sol_z, rhs_buffer, tmp_N1, tmp_N2, tmp_N3,
-        op_wn, op_wn2, op_wdim, op_Ad, op_As, op_Ginv,
-        ψ, group_scale)
+        sol_y, sol_z,
+        ψ, group_scale, layout)
 end
 
 function load_observed_data(yX::DataFrame;
@@ -365,19 +302,5 @@ function create_thread_workspaces(model::SGEModel, nt::Int)
     ) for _ in 1:nt]
 end
 
-# Lag et enkelt ThreadWorkspace som aliaser modellens egne buffere (for sekvensiell bruk)
-function model_workspace(model::SGEModel)
-    n = length(model.y)
-    N = size(model.Ainv, 1)
-    ng = length(model.groups.members_id)
-    return ThreadWorkspace(
-        model.rhs_buffer,
-        model.op_wn, model.op_wn2, model.op_wdim,
-        model.op_Ad, model.op_As, model.op_Ginv,
-        model.tmp_N1, model.tmp_N2, model.tmp_N3,
-        zeros(n),       # vi_out
-        zeros(N), zeros(N),  # precond_tmp1, precond_tmp2
-        [zeros(n_h) for n_h in model.env_n_levels],
-        zeros(ng)
-    )
-end
+# Lag et enkelt ThreadWorkspace med egne buffere (for sekvensiell/diagnostisk bruk)
+model_workspace(model::SGEModel) = create_thread_workspaces(model, 1)[1]

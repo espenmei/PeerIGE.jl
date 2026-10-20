@@ -92,7 +92,6 @@ model1 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)
     cg_reltol_early=1e-5,
     cg_early_iters=4,
     cg_reltol=1e-7,
-    threaded=true,
     log_file=joinpath(OUT_LOG_DIR, "aireml_log_base.csv"),
 )
 
@@ -120,7 +119,6 @@ model2 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
     cg_reltol_early=1e-5,
     cg_early_iters=4,
     cg_reltol=1e-7,
-    threaded=true,
     log_file=joinpath(OUT_LOG_DIR, "aireml_log_env.csv"),
 )
 
@@ -152,7 +150,6 @@ model3 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
     cg_reltol_early=1e-5,
     cg_early_iters=4,
     cg_reltol=1e-7,
-    threaded=true,
     log_file=joinpath(OUT_LOG_DIR, "aireml_log_env3.csv"),
 )
 

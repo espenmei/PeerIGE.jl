@@ -163,7 +163,7 @@ begin
     gs_real = build_group_structure(obs_table, roster, size(Ainv,1))
 
     run_opts = (max_iter=2, k=3, damping=0.5, cg_maxiter=300, ai_maxiter=100,
-                threaded=false, verbose_cg=false, seed=42)
+ verbose_cg=false, seed=42)
 
     mA = SGEModel(obs.y, obs.X, Ainv, L_Ainv, gs_real, 1.0, 0.2, 0.0, 2.0; ψ=0.0)
     rA = run_aireml(mA; run_opts...)
@@ -196,7 +196,7 @@ begin
     gs_real = build_group_structure(obs_table, roster, size(Ainv,1))
 
     run_opts = (max_iter=2, k=3, damping=0.5, cg_maxiter=300, ai_maxiter=100,
-                threaded=false, verbose_cg=false, seed=42)
+ verbose_cg=false, seed=42)
 
     m_explicit = SGEModel(obs.y, obs.X, Ainv, L_Ainv, gs_real, 1.0, 0.2, 0.0, 2.0; ψ=0.0)
     r_explicit = run_aireml(m_explicit; run_opts...)

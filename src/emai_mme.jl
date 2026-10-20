@@ -1,7 +1,8 @@
 # =====================================================================
 # MIXED MODEL EQUATIONS (matrix-free)
-# The MME operator (LHS * v), RHS construction, CG solves, V_i operators,
-# and preconditioner builders. Never forms dense A/V/MME. Included via emai.jl.
+# The MME operator (LHS * v), RHS construction, CG solves, and V_i operators.
+# Never forms dense A/V/MME. Preconditioners live in emai_precond.jl.
+# Included via emai.jl.
 # =====================================================================
 # Operatøren som representerer LHS i MME (LHS * v)
 struct MMEOperator{T}
@@ -45,16 +46,14 @@ end
 
 function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::Vector{Float64}, sol_vector::Vector{Float64}, ws::ThreadWorkspace)
     n = length(model.y)
-    N = size(model.Ainv, 1)
-    nf = size(model.X, 2)
     gs = model.groups
-
+    lay = model.layout
     H = length(model.env_ids)
 
     # 1. Hent ut estimatene fra løsningsvektoren (sol_vector)
-    beta = @view sol_vector[1:nf]
-    a_d = @view sol_vector[nf+1:nf+N]
-    a_s = @view sol_vector[nf+N+1:nf+2N]
+    beta = @view sol_vector[lay.fixed]
+    a_d = @view sol_vector[lay.direct]
+    a_s = @view sol_vector[lay.social]
 
     # 2. Beregn y_hat in-place i out, deretter Px
     mul!(out, model.X, beta)
@@ -68,15 +67,12 @@ function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::V
     end
 
     # + env contributions: Zh * ch
-    env_offset = nf + 2N
     for h in 1:H
         ids = model.env_ids[h]
-        n_h = model.env_n_levels[h]
-        c_h = @view sol_vector[env_offset+1:env_offset+n_h]
+        c_h = @view sol_vector[lay.env[h]]
         @inbounds for i in 1:n
             out[i] += c_h[ids[i]]
         end
-        env_offset += n_h
     end
 
     # 3. out = (y_vector - y_hat) / σ²_e
@@ -185,27 +181,23 @@ end
 function (op::MMEOperator{T})(res, v) where T
     m = op.m
     n = length(m.y)
-    N = size(m.Ainv, 1)
-    nf = size(m.X, 2)
     gs = m.groups
+    lay = m.layout
     H = length(m.env_ids)
-    v_f = @view(v[1:nf])
-    v_d = @view(v[nf+1:nf+N])
-    v_s = @view(v[nf+N+1:nf+2N])
-    res_f = @view(res[1:nf])
-    res_d = @view(res[nf+1:nf+N])
-    res_s = @view(res[nf+N+1:nf+2N])
+    v_f = @view(v[lay.fixed])
+    v_d = @view(v[lay.direct])
+    v_s = @view(v[lay.social])
+    res_f = @view(res[lay.fixed])
+    res_d = @view(res[lay.direct])
+    res_s = @view(res[lay.social])
     fill!(res, 0.0)
 
     # Env views (v_env[h] og res_env[h])
-    env_offset = nf + 2N
     v_env = Vector{SubArray}(undef, H)
     res_env = Vector{SubArray}(undef, H)
     for h in 1:H
-        n_h = m.env_n_levels[h]
-        v_env[h] = @view(v[env_offset+1:env_offset+n_h])
-        res_env[h] = @view(res[env_offset+1:env_offset+n_h])
-        env_offset += n_h
+        v_env[h] = @view(v[lay.env[h]])
+        res_env[h] = @view(res[lay.env[h]])
     end
 
     # 1. Partiell y_hat = X*v_f + Zd*v_d + sum_h Zh*v_h  (uten Zs*v_s ennå)
@@ -267,69 +259,53 @@ function (op::MMEOperator{T})(res, v) where T
 end
 
 # Bygger MME høyresiden: rhs = [X'*v; Zd'*v; Zs'*v; (Zh'*v for h=1..H)]
-function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGEModel, N::Int, nf::Int, ws::ThreadWorkspace)
+function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGEModel, ws::ThreadWorkspace)
     n = length(v)
+    lay = model.layout
     fill!(rhs, 0.0)
-    mul!(@view(rhs[1:nf]), model.X', v)
+    mul!(@view(rhs[lay.fixed]), model.X', v)
+    nf = lay.nf
     for i in 1:n
         @inbounds rhs[nf+model.groups.obs_to_id[i]] += v[i]
     end
-    apply_Zs_transpose!(@view(rhs[nf+N+1:nf+2N]), v, model.groups, ws.group_sum, model.group_scale)
-    env_offset = nf + 2N
+    apply_Zs_transpose!(@view(rhs[lay.social]), v, model.groups, ws.group_sum, model.group_scale)
     for h in 1:length(model.env_ids)
         ids = model.env_ids[h]
-        n_h = model.env_n_levels[h]
-        rhs_h = @view(rhs[env_offset+1:env_offset+n_h])
+        rhs_h = @view(rhs[lay.env[h]])
         @inbounds for i in 1:n
             rhs_h[ids[i]] += v[i]
         end
-        env_offset += n_h
     end
+end
+
+# Felles MME-løser: bygg RHS for `source`, kjør CG inn i `dest`.
+# `label` styrer kun loggeteksten (CG(y)/CG(z)/...); `verbose` slår på iterasjonslogg.
+function _solve_mme!(dest::Vector{Float64}, source::Vector{Float64}, model::SGEModel,
+    ws::ThreadWorkspace, P_inv; reltol, maxiter, verbose::Bool, label::AbstractString)
+    rhs = ws.rhs_buffer
+    build_rhs!(rhs, source, model, ws)
+
+    op = make_mme_operator(model, ws)
+    if verbose
+        _, ch = cg!(dest, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter, log=true)
+        niter = ch.iters
+        final_res = ch.data[:resnorm][end]
+        flag = niter < maxiter ? "✓" : "⚠ MAXITER"
+        @printf("    CG(%s): %d iter, res=%.2e %s\n", label, niter, final_res, flag)
+    else
+        cg!(dest, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter)
+    end
+    return dest
 end
 
 # Løser for y (faktiske data)
-function solve_mme_y!(model::SGEModel, ws::ThreadWorkspace, P_inv; reltol=1e-7, maxiter=2000, verbose=true)
-    n = length(model.y)
-    N = size(model.Ainv, 1)
-    nf = size(model.X, 2)
-
-    rhs = ws.rhs_buffer
-    build_rhs!(rhs, model.y, model, N, nf, ws)
-
-    op = make_mme_operator(model, ws)
-    if verbose
-        _, ch = cg!(model.sol_y, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter, log=true)
-        niter = ch.iters
-        final_res = ch.data[:resnorm][end]
-        flag = niter < maxiter ? "✓" : "⚠ MAXITER"
-        @printf("    CG(y): %d iter, res=%.2e %s\n", niter, final_res, flag)
-    else
-        cg!(model.sol_y, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter)
-    end
-end
+solve_mme_y!(model::SGEModel, ws::ThreadWorkspace, P_inv; reltol=1e-7, maxiter=2000, verbose=true) =
+    _solve_mme!(model.sol_y, model.y, model, ws, P_inv; reltol=reltol, maxiter=maxiter, verbose=verbose, label="y")
 
 # Løser for z_i (stokastisk trace)
-function solve_mme_z!(sol_z_i::Vector{Float64}, model::SGEModel,
-    z_vector::Vector{Float64}, ws::ThreadWorkspace, P_inv;
-    reltol=1e-7, maxiter=2000, verbose=false)
-    n = length(z_vector)
-    N = size(model.Ainv, 1)
-    nf = size(model.X, 2)
-
-    rhs = ws.rhs_buffer
-    build_rhs!(rhs, z_vector, model, N, nf, ws)
-
-    op = make_mme_operator(model, ws)
-    if verbose
-        _, ch = cg!(sol_z_i, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter, log=true)
-        niter = ch.iters
-        final_res = ch.data[:resnorm][end]
-        flag = niter < maxiter ? "✓" : "⚠ MAXITER"
-        @printf("    CG(z): %d iter, res=%.2e %s\n", niter, final_res, flag)
-    else
-        cg!(sol_z_i, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter)
-    end
-end
+solve_mme_z!(sol_z_i::Vector{Float64}, model::SGEModel, z_vector::Vector{Float64},
+    ws::ThreadWorkspace, P_inv; reltol=1e-7, maxiter=2000, verbose=false) =
+    _solve_mme!(sol_z_i, z_vector, model, ws, P_inv; reltol=reltol, maxiter=maxiter, verbose=verbose, label="z")
 
 function apply_A!(out::Vector{Float64}, L_Ainv, x_N::Vector{Float64}, tmp::Vector{Float64})
     # A * x = Ainv⁻¹ * x via Cholesky (Ainv = L*L')
@@ -340,19 +316,16 @@ function apply_A!(out::Vector{Float64}, L_Ainv, x_N::Vector{Float64}, tmp::Vecto
 end
 
 # In-place Vi * u — bruker workspace-buffere (trådsikkert og sekvensiellt)
-function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws::ThreadWorkspace)
+function get_Vi_u!(out::Vector{Float64}, u_n, comp::VarianceComponent, model::SGEModel, ws::ThreadWorkspace)
     gs = model.groups
-    N = size(model.Ainv, 1)
     n = length(u_n)
+    kind = comp.kind
 
-    # Env effects: :env1, :env2, ...
-    type_str = String(type)
-    if startswith(type_str, "env")
-        h = parse(Int, type_str[4:end])
-        return get_Vi_env_u!(out, u_n, h, model, ws)
+    if kind == VC_ENV
+        return get_Vi_env_u!(out, u_n, comp.env_idx, model, ws)
     end
 
-    if type == :d  # Zd * A * Zd' * u
+    if kind == VC_D  # Zd * A * Zd' * u
         fill!(ws.tmp_N1, 0.0)
         for i in 1:n
             @inbounds ws.tmp_N1[gs.obs_to_id[i]] += u_n[i]
@@ -362,7 +335,7 @@ function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws:
             @inbounds out[i] = ws.tmp_N2[gs.obs_to_id[i]]
         end
 
-    elseif type == :s # Zs_ψ * A * Zs_ψ' * u
+    elseif kind == VC_S # Zs_ψ * A * Zs_ψ' * u
         fill!(ws.tmp_N1, 0.0)
         apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum, model.group_scale)
         apply_A!(ws.tmp_N2, model.L_Ainv, ws.tmp_N1, ws.tmp_N3)
@@ -372,7 +345,7 @@ function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws:
             out[i] = (ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]) * model.group_scale[gs.obs_to_group[i]]
         end
 
-    elseif type == :ds # (Zd * A * Zs_ψ' + Zs_ψ * A * Zd') * u
+    elseif kind == VC_DS # (Zd * A * Zs_ψ' + Zs_ψ * A * Zd') * u
         # Del 1: Zd * A * Zs_ψ' * u
         fill!(ws.tmp_N1, 0.0)
         apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum, model.group_scale)
@@ -392,8 +365,10 @@ function get_Vi_u!(out::Vector{Float64}, u_n, type::Symbol, model::SGEModel, ws:
             out[i] += (ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]) * model.group_scale[gs.obs_to_group[i]]
         end
 
-    else # :e
+    elseif kind == VC_E
         copyto!(out, u_n)
+    else
+        error("Unknown variance component kind=$(kind)")
     end
     return out
 end
@@ -415,96 +390,6 @@ function get_Vi_env_u!(out::Vector{Float64}, u_n, h::Int, model::SGEModel, ws::T
     return out
 end
 
-function solve_mme_direct!(x_sol, model::SGEModel, v_vector::Vector{Float64},
-    ws::ThreadWorkspace, P_inv; reltol=1e-5, maxiter=500)
-    n = length(v_vector)
-    N = size(model.Ainv, 1)
-    nf = size(model.X, 2)
-    rhs = ws.rhs_buffer
-    build_rhs!(rhs, v_vector, model, N, nf, ws)
-
-    op = make_mme_operator(model, ws)
-    cg!(x_sol, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter)
-end
-
-function get_preconditioner(model::SGEModel, ws::ThreadWorkspace)
-    N = size(model.Ainv, 1)
-    nf = size(model.X, 2)
-
-    # 1. Faste effekter: diag(X'X)
-    diag_f_inv = Vector{Float64}(undef, nf)
-    for j in 1:nf
-        @inbounds diag_f_inv[j] = 1.0 / max(dot(@view(model.X[:, j]), @view(model.X[:, j])), 1e-6)
-    end
-
-    # 2. Genetisk blokk: M⁻¹ = (G ⊗ A) / σ²_e
-    G = [model.σ2_d model.σ_ds; model.σ_ds model.σ2_s]
-    G_scaled = G ./ model.σ2_e
-
-    # 3. Env blocks: diag preconditioner  1 / (count_j + σ²_e / σ²_h)
-    env_diag_inv = Vector{Float64}[]
-    for h in 1:length(model.env_ids)
-        counts = model.env_counts[h]
-        λ_h = model.σ2_e / model.σ2_env[h]
-        push!(env_diag_inv, [1.0 / (counts[j] + λ_h) for j in eachindex(counts)])
-    end
-
-    return BlockPreconditioner(diag_f_inv, G_scaled, model.L_Ainv, nf, N,
-        ws.precond_tmp1, ws.precond_tmp2, env_diag_inv)
-end
-
-function get_diag_preconditioner(model::SGEModel)
-    N = size(model.Ainv, 1)
-    nf = size(model.X, 2)
-    n = length(model.y)
-    gs = model.groups
-
-    diag_Ainv = diag(model.Ainv)
-    Ginv = inv([model.σ2_d model.σ_ds; model.σ_ds model.σ2_s])
-    λ_dd = Ginv[1, 1] * model.σ2_e
-    λ_ss = Ginv[2, 2] * model.σ2_e
-
-    dim = get_dim(model)
-    d = zeros(dim)
-
-    # 1. Faste effekter: diag(X'X)
-    for j in 1:nf
-        @inbounds d[j] = dot(@view(model.X[:, j]), @view(model.X[:, j]))
-    end
-
-    # 2. Direkte genetikk: diag(Zd'Zd) + Ainv * λ_dd
-    diag_ZdZd = @view d[nf+1:nf+N]
-    for i in 1:n
-        @inbounds diag_ZdZd[gs.obs_to_id[i]] += 1.0
-    end
-    @. d[nf+1:nf+N] = diag_ZdZd + diag_Ainv * λ_dd
-
-    # 3. Sosial genetikk: diag(Zs'Zs) + Ainv * λ_ss
-    # diag(Zs'Zs)[bid] = o_g - is_observed[bid]   for bid ∈ members_g, m_g >= 2
-    diag_ZsZs = @view d[nf+N+1:nf+2N]
-    for g in eachindex(gs.members_id)
-        members = gs.members_id[g]
-        if length(members) > 1
-            o_g = gs.obs_count_per_group[g]
-            c2_g = model.group_scale[g]^2
-            for id in members
-                @inbounds diag_ZsZs[id] += (o_g - (gs.is_observed[id] ? 1 : 0)) * c2_g
-            end
-        end
-    end
-    @. d[nf+N+1:nf+2N] = diag_ZsZs + diag_Ainv * λ_ss
-
-    # 4. Env blocks: diag(Zh'Zh) + σ²_e/σ²_h = count_j + λ_h
-    env_offset = nf + 2N
-    for h in 1:length(model.env_ids)
-        counts = model.env_counts[h]
-        λ_h = model.σ2_e / model.σ2_env[h]
-        n_h = model.env_n_levels[h]
-        @inbounds for j in 1:n_h
-            d[env_offset+j] = counts[j] + λ_h
-        end
-        env_offset += n_h
-    end
-
-    return DiagPreconditioner(1.0 ./ max.(d, 1e-6))
-end
+solve_mme_direct!(x_sol::Vector{Float64}, model::SGEModel, v_vector::Vector{Float64},
+    ws::ThreadWorkspace, P_inv; reltol=1e-5, maxiter=500) =
+    _solve_mme!(x_sol, v_vector, model, ws, P_inv; reltol=reltol, maxiter=maxiter, verbose=false, label="direct")

@@ -12,7 +12,6 @@ const DILUTION_MAX_ITER = parse(Int, get(ENV, "DILUTION_RECOVERY_MAX_ITER", "15"
 const DILUTION_K = parse(Int, get(ENV, "DILUTION_RECOVERY_K", "20"))
 const DILUTION_CG_MAXITER = parse(Int, get(ENV, "DILUTION_RECOVERY_CG_MAXITER", "5000"))
 const DILUTION_AI_MAXITER = parse(Int, get(ENV, "DILUTION_RECOVERY_AI_MAXITER", "500"))
-const DILUTION_THREADED = get(ENV, "DILUTION_RECOVERY_THREADED", "true") == "true"
 const DILUTION_PSI_VALUES = begin
     raw = get(ENV, "DILUTION_RECOVERY_PSI_VALUES", "0.0,0.5,1.0")
     parts = split(replace(raw, "," => " "))
@@ -105,7 +104,6 @@ for psi in DILUTION_PSI_VALUES
         cg_early_iters=4,
         cg_reltol=1e-7,
         ai_maxiter=DILUTION_AI_MAXITER,
-        threaded=DILUTION_THREADED,
         verbose_cg=false,
         seed=42,
     )
@@ -176,11 +174,10 @@ let
             cg_early_iters=4,
             cg_reltol=1e-7,
             ai_maxiter=DILUTION_AI_MAXITER,
-            threaded=DILUTION_THREADED,
-            verbose_cg=false,
-            seed=42,
-        )
-        errors[ψ_fit] = ssre(r)
+                verbose_cg=false,
+                seed=42,
+            )
+            errors[ψ_fit] = ssre(r)
         @printf("[dilution-misspec] ψ_fit=%.1f  SSRE=%.6f  d=%.4f s=%.4f e=%.4f\n",
             ψ_fit, errors[ψ_fit], r.σ2_d, r.σ2_s, r.σ2_e)
     end

@@ -4,19 +4,19 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## What This Repository Contains
 
-- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators, preconditioners), `src/emai_trace.jl` (Hutchinson trace probes), and `src/emai_aireml.jl` (score/AI assembly and the `run_aireml` driver). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects (`σ2_env` for 0–2 grouping factors)
+- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), and `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `run_aireml` driver). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects (`σ2_env` for 0–2 grouping factors)
 - `run_emai.jl`: runnable entrypoint; fits both the base SGE model and the SGE+household model, prints a comparison table
 - `computational_approach.md`: math and algorithm overview
 - `sim/`: simulation scripts in R (`sim_peer.R`, `sim_peer_evn.R`; `sim_peer_evn.R` adds household/classroom/school shared environment effects); each writes the two-table format (`yX_obs.csv`, `roster.csv`)
 - `yX_obs.csv`: observed-only rows — one row per observed outcome, with columns `y`, `id_ped`, covariates, and optional environment IDs (e.g. `household`)
 - `roster.csv`: full social group membership for all relevant pedigree IDs, with columns `id_ped` and `group` (includes unobserved animals)
 - `Ainv_triplet.csv`, `LAinv_triplet.csv`: sparse pedigree matrix inputs in triplet format
-- `bench_threads.jl`: threading benchmark (compares sequential vs threaded timing and correctness)
+- `bench_threads.jl`: threading benchmark (times a threaded run and reports per-iteration timing and final estimates)
 - `tests`: test entrypoints and smoke checks for missing-response handling and H=0/H=1 models
 
 ## Folder Structure
 
-- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_mme.jl`, `emai_trace.jl`, `emai_aireml.jl`)
+- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_precond.jl`, `emai_mme.jl`, `emai_aireml.jl`)
 - `sim`: R simulation scripts that generate the input CSVs
 - `outputs/logs`: AI-REML and benchmark log CSVs
 - `outputs/results`: JLD2 model result files
@@ -57,7 +57,7 @@ The runner currently:
 4. Fits **Model 1**: base SGE (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`), saves to `outputs/results/aireml_result_base.jld2`
 5. Fits **Model 2**: SGE + household shared environment, saves to `outputs/results/aireml_result_env.jld2`
 6. Prints a side-by-side parameter comparison table
-7. All runs use `threaded=true` by default — start with `--threads 8`
+7. All runs are threaded — start with `--threads 8`
 
 ## Key Outputs
 

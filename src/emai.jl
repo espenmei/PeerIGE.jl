@@ -13,13 +13,13 @@ LinearAlgebra.BLAS.set_num_threads(1)
 # PeerIGE.jl — Social Genetic Effects AI-REML
 # This file is a thin façade. Implementation is split across:
 #   emai_core.jl    — shared types and observed-data / group construction
+#   emai_precond.jl — diagonal and block preconditioners
 #   emai_mme.jl     — matrix-free mixed model equations, CG solves, V_i ops
-#   emai_trace.jl   — stochastic trace probes (Hutchinson randomisation)
-#   emai_aireml.jl  — score/AI assembly and the run_aireml driver
+#   emai_aireml.jl  — trace probes, score/AI assembly and the run_aireml driver
 # The using/import statements above are shared by every included file.
 # =====================================================================
 
 include(joinpath(@__DIR__, "emai_core.jl"))
+include(joinpath(@__DIR__, "emai_precond.jl"))
 include(joinpath(@__DIR__, "emai_mme.jl"))
-include(joinpath(@__DIR__, "emai_trace.jl"))
 include(joinpath(@__DIR__, "emai_aireml.jl"))

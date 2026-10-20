@@ -43,8 +43,12 @@ Parameters worth tuning carefully:
 - `cg_reltol`: PCG convergence tolerance
 - `ai_maxiter`, `ai_reltol`: tolerances for AI-matrix-related solves
 - `use_block_precond`: selects block versus diagonal preconditioner
-- `threaded`: enables threaded z-solves, trace estimation, and AI work
 - `seed`: controls reproducible Hutchinson probes
+
+Note: z-solves, trace estimation, and AI work are always threaded via the
+`_threaded_*` helpers; workspaces are allocated per thread. Launch Julia with
+`--threads N` to control parallelism (a single thread simply runs the
+`@threads` loops serially).
 
 ## Invariants To Preserve
 
@@ -76,7 +80,7 @@ After meaningful code changes, verify at least the following:
 3. `aireml_log_base.csv` and `aireml_log_env.csv` are produced with sensible timing and parameters
 4. Parameter updates remain finite and the `G` matrix stays valid
 5. Threaded changes do not introduce shared mutable state
-6. For any change touching a `_threaded_*` helper or `compute_score_and_ai`, run `julia --threads 8 --project=. bench_threads.jl` and confirm `Max |Δ| < 1e-4` and speedup > 1.5x
+6. For any change touching a `_threaded_*` helper or `compute_score_and_ai`, run `julia --threads 8 --project=. bench_threads.jl` and confirm it converges to sensible estimates with reasonable per-iteration timing
 
 ## Suggested Task Shapes For AI Collaboration
 
@@ -86,7 +90,6 @@ Good tasks:
 - add input validation for matrix and vector dimensions
 - add a small test for one operator identity
 - explain or document one numerical block
-- compare threaded and non-threaded behavior on one run
 
 Avoid open-ended tasks like “clean up the whole file” or “optimize everything”.
 

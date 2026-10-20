@@ -82,7 +82,7 @@ inputs = load_recovery_inputs()
 model = SGEModel(inputs.y_obs, inputs.X_obs, inputs.Ainv, inputs.L_Ainv, inputs.gs,
     1.0, 0.2, 0.0, 2.0)
 
-println("[param-recovery] Running AI-REML (max_iter=15, k=20, threaded=true)...")
+println("[param-recovery] Running AI-REML (max_iter=15, k=20)...")
 result = run_aireml(
     model,
     max_iter=15,
@@ -92,7 +92,6 @@ result = run_aireml(
     cg_reltol_early=1e-5,
     cg_early_iters=4,
     cg_reltol=1e-7,
-    threaded=true,
     verbose_cg=false,
 )
 
@@ -139,7 +138,6 @@ result_psi = run_aireml(
     damping=0.5,
     cg_maxiter=500,
     cg_reltol=1e-6,
-    threaded=false,
     verbose_cg=false,
     seed=99,
 )
@@ -152,7 +150,6 @@ result_def = run_aireml(
     damping=0.5,
     cg_maxiter=500,
     cg_reltol=1e-6,
-    threaded=false,
     verbose_cg=false,
     seed=99,
 )

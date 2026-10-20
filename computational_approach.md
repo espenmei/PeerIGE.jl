@@ -187,6 +187,36 @@ $$\boldsymbol{\theta}^{(t+1)} = \boldsymbol{\theta}^{(t)} + \alpha \cdot \text{A
 
 where $\mathbf{s}$ is the REML score vector and AI is the Average Information matrix ($4 \times 4$).
 
+The overall procedure, as implemented in `run_aireml`, is summarized below. Each
+referenced quantity is defined in the subsections that follow.
+
+```text
+AI-REML(model, θ⁽⁰⁾, k, α₀, max_iter)
+──────────────────────────────────────────────────────────────────────
+ input : model (y, X, A⁻¹, L, groups, env), initial variances θ⁽⁰⁾,
+         k probe vectors, initial damping α₀, iteration cap max_iter
+ output: converged variances θ, BLUE β, BLUP (a_d, a_s, c), AI matrix
+
+ z₁..z_k ← make_trace_probes(n, k, seed)      # fixed across all iterations
+ for t = 1, 2, …, max_iter:
+   1. M⁻¹ ← build_preconditioner(θ⁽ᵗ⁾)        # block or diagonal, per θ
+   2. sol_y ← PCG(C(θ), rhs_y; M⁻¹, warm start);  Py ← project(sol_y)
+   3. for j = 1..k in parallel:               # threaded z-solves
+        sol_zⱼ ← PCG(C(θ), zⱼ; M⁻¹);  Pzⱼ ← project(sol_zⱼ)
+   4. for each variance param i:              # score vector s
+        ViPy ← Vᵢ · Py
+        tr̂(P Vᵢ) ← (1/k) Σⱼ zⱼ' (Vᵢ · Pzⱼ)   # Hutchinson estimate
+        sᵢ ← ½ (Py' ViPy − tr̂(P Vᵢ))
+   5. for each param j in parallel:           # Average Information matrix
+        PVjPy ← project(PCG(C(θ), Vⱼ·Py; M⁻¹))
+      AIᵢⱼ ← ½ Py' (Vᵢ · PVjPy)               # symmetric, cheap mat-vecs
+   6. δ ← (AI + εI)⁻¹ s;   SE ← sqrt(diag((AI + εI)⁻¹))
+   7. α ← α₀;  halve α (≤20×) until θ⁽ᵗ⁾ + α·δ keeps all σ² > 0 and G ≻ 0
+   8. θ⁽ᵗ⁺¹⁾ ← θ⁽ᵗ⁾ + α·δ
+   9. if ‖Δθ‖ / ‖θ⁽ᵗ⁾‖ < tol: break          # convergence
+ final PCG solve at θ → BLUE β, BLUP (a_d, a_s, c)
+```
+
 ### 3.1 Score vector
 
 **Intuition:** The score vector $\mathbf{s}$ is the gradient of the restricted log-likelihood with respect to the variance parameters. Each component $s_i$ tells you the direction and magnitude to move parameter $\theta_i$ to improve the likelihood. When all $s_i \approx 0$, the algorithm has converged.

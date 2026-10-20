@@ -55,6 +55,7 @@ Note: z-solves, trace estimation, and AI work are always threaded via the
 - `G = [σ2_d σ_ds; σ_ds σ2_s]` must remain positive definite
 - `σ2_d`, `σ2_s`, and `σ2_e` must stay positive
 - `σ2_env[h]` must stay positive for each env factor `h`
+- `σ2_pe` must stay positive when `peer_env=true`; with `peer_env=false` the model, layout, and results must be bit-identical to the model without the feature
 - Threaded paths must use thread-local mutable buffers only
 - `A` must never be formed explicitly; apply it through sparse triangular solves
 - Numerical guards like `max(..., 1e-6)` and step-halving are deliberate stability controls
@@ -68,6 +69,7 @@ Note: z-solves, trace estimation, and AI work are always threaded via the
 - `compute_score_and_ai`
 - parameter updates in `run_aireml`
 - `env_ids`, `env_n_levels`, `env_counts`, `env_tmp` fields in `SGEModel` and `ThreadWorkspace`
+- `peer_env`, `pe_ids`, `pe_data_diag` in `SGEModel` and the `pe` block of `SolutionLayout` (the operator reuses `op.Ad` as scratch for `a_s + scatter(p)` before `apply_GinvAinv!` overwrites it)
 
 For changes in these sections, define the expected mathematical identity before editing.
 

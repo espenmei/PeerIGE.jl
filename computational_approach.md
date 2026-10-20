@@ -17,7 +17,7 @@ In matrix notation:
 
 $$\mathbf{y} = X\boldsymbol{\beta} + Z_d \mathbf{a}_d + Z_s \mathbf{a}_s + \sum_{h=1}^{H} Z_h \mathbf{c}_h + \mathbf{e}$$
 
-where $Z_h$ is the $n \times n_h$ indicator matrix mapping observations to environment-group levels. The $H$ environment factors are optional: setting $H=0$ gives the base SGE model. The total number of variance components is $n_p = 4 + H$.
+where $Z_h$ is the $n \times n_h$ indicator matrix mapping observations to environment-group levels. The $H$ environment factors are optional: setting $H=0$ gives the base SGE model. The total number of variance components is $n_p = 4 + H$ (plus one with the optional peer environmental effect, §1.7).
 
 $$\begin{pmatrix} \mathbf{a}_d \\ \mathbf{a}_s \end{pmatrix} \sim N\!\left(\mathbf{0},\; G \otimes A\right), \quad G = \begin{pmatrix} \sigma^2_d & \sigma_{ds} \\ \sigma_{ds} & \sigma^2_s \end{pmatrix}$$
 
@@ -135,6 +135,26 @@ Practically, this means:
 
 `roster.csv` and the sparse matrix files do not benefit materially from sorting; they are processed differently or only once during setup.
 
+### 1.7 Optional social peer environmental effect ($\sigma^2_{pe}$)
+
+With `peer_env=true` the model adds a **non-genetic** counterpart of $\mathbf{a}_s$: each roster member $j$ has an effect $p_j \sim N(0, \sigma^2_{pe})$, independent across individuals and uncorrelated with $e$, that enters peers' outcomes through the same diluted, self-excluding peer sum as $a_s$:
+
+$$\mathbf{y} = \ldots + Z_s\mathbf{a}_s + Z_{pe}\,\mathbf{p} + \mathbf{e}, \qquad Z_{pe} = Z_s[:, \text{roster}], \qquad \frac{\partial V}{\partial \sigma^2_{pe}} = Z_s Z_s'.$$
+
+There is one $p$ level per roster member, including members without an outcome. It adds $n_{pe}$ (roster size) to $\dim$ and one parameter to $\boldsymbol{\theta}$, ordered last: $(\sigma^2_d, \sigma^2_s, \sigma_{ds}, \sigma^2_e, \sigma^2_{c_1..c_H}, \sigma^2_{pe})$.
+
+**Identification.** For two observed members of a group with roster size $m_g$ and dilution factor $c_g$, $p$ contributes $c_g^2(m_g-1)\sigma^2_{pe}$ to each variance and $c_g^2(m_g-2)\sigma^2_{pe}$ to their covariance.
+- *Versus a classroom effect on the same groups:* the shared part is $\sigma^2_{class} + c_g^2(m_g-2)\sigma^2_{pe}$, an intercept plus a slope in group size. $\sigma^2_{pe}$ is therefore identified only through variation in $c_g^2(m_g-2)$ across groups, and `SGEModel` warns when that variation is negligible. $m_g$ is the **full roster size**, so incomplete rosters bias the slope.
+- *Versus $\sigma^2_s$:* among unrelated peers, $a_s$ produces exactly the same pattern ($\sigma^2_s$ replaces $\sigma^2_{pe}$). The two are separated only by off-diagonal relationships in $A$: relatives in the same group, and relatives in *different* groups (e.g. siblings in other cohorts), whose $a_s$ are correlated but whose $p$ are not. Expect a strong negative sampling correlation between $\hat\sigma^2_s$ and $\hat\sigma^2_{pe}$; `run_aireml` prints $\text{corr}(\hat\sigma^2_{pe}, \cdot)$ from $\text{AI}^{-1}$ each iteration.
+
+A covariance between $p_j$ and $e_j$ is deliberately not modelled: it is not identifiable jointly with a classroom effect on the same groups.
+
+**Computation.** Because $Z_{pe}$ is a column subset of $Z_s$, no new data operations are needed:
+- $Z_s\mathbf{a}_s + Z_{pe}\mathbf{p} = Z_s(\mathbf{a}_s + \text{scatter}(\mathbf{p}))$, i.e. one vector add before the existing group sums.
+- The data part of the $p$ equations equals $Z_s'\hat{\mathbf{y}}$ gathered at roster IDs. The prior adds $(\sigma^2_e/\sigma^2_{pe})\,I$.
+- $V_{pe}u = Z_sZ_s'u$ reuses `apply_Zs_transpose!` and group sums, with no $A$ solve, so it costs $O(n + n_{pe})$.
+- Both preconditioners use the diagonal $1/(c_g^2(o_g - \mathbb{1}[j\ \text{observed}]) + \sigma^2_e/\sigma^2_{pe})$ on the $p$ block. The block preconditioner does not capture the $a_s$–$p$ coupling (identical data columns, separated only by the $A^{-1}$ vs $I$ priors), so CG iteration counts should be monitored when enabling `peer_env`.
+
 ## 2. Mixed Model Equations (MME)
 
 Henderson's MME for this model are:
@@ -236,6 +256,7 @@ where $P = V^{-1} - V^{-1}X(X'V^{-1}X)^{-1}X'V^{-1}$ is the projection matrix an
 | $\sigma_{ds}$ | $Z_d A Z_s' + Z_s A Z_d'$ |
 | $\sigma^2_e$ | $I_n$ |
 | $\sigma^2_{c_h}$ | $Z_h Z_h'$ |
+| $\sigma^2_{pe}$ (optional, `peer_env=true`) | $Z_s Z_s'$ |
 
 The $Z_h Z_h'$ application is a **scatter-gather** operation: for output $i$, $(Z_h Z_h' u)_i = \sum_{j:\, h(j)=h(i)} u_j$. This is $O(n)$ and requires no matrix storage.
 

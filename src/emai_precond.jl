@@ -31,6 +31,7 @@ struct BlockPreconditioner
     tmp1::Vector{Float64}           # workspace (length N)
     tmp2::Vector{Float64}           # workspace (length N)
     env_diag_inv::Vector{Vector{Float64}}  # H vectors, 1/(count_j + σ²_e/σ²_h)
+    pe_diag_inv::Vector{Float64}    # 1/(diag(Z_pe'Z_pe) + σ²_e/σ²_pe); tom uten peer env
 end
 
 function ldiv!(z::AbstractVector, P::BlockPreconditioner, r::AbstractVector)
@@ -76,6 +77,12 @@ function ldiv!(z::AbstractVector, P::BlockPreconditioner, r::AbstractVector)
         end
     end
 
+    # Peer env block: diagonal preconditioner
+    pe_rng = P.layout.pe
+    @inbounds @simd for k in eachindex(P.pe_diag_inv)
+        z[pe_rng[k]] = P.pe_diag_inv[k] * r[pe_rng[k]]
+    end
+
     return z
 end
 
@@ -100,8 +107,15 @@ function get_preconditioner(model::SGEModel, ws::ThreadWorkspace)
         push!(env_diag_inv, [1.0 / (counts[j] + λ_h) for j in eachindex(counts)])
     end
 
+    # 4. Peer env block: diag preconditioner  1 / (diag(Z_pe'Z_pe) + σ²_e / σ²_pe)
+    pe_diag_inv = Float64[]
+    if model.peer_env
+        λ_pe = model.σ2_e / model.σ2_pe
+        pe_diag_inv = [1.0 / (d + λ_pe) for d in model.pe_data_diag]
+    end
+
     return BlockPreconditioner(diag_f_inv, G_scaled, model.L_Ainv, model.layout,
-        ws.precond_tmp1, ws.precond_tmp2, env_diag_inv)
+        ws.precond_tmp1, ws.precond_tmp2, env_diag_inv, pe_diag_inv)
 end
 
 function get_diag_preconditioner(model::SGEModel)
@@ -152,6 +166,15 @@ function get_diag_preconditioner(model::SGEModel)
         rng = lay.env[h]
         @inbounds for j in eachindex(counts)
             d[rng[j]] = counts[j] + λ_h
+        end
+    end
+
+    # 5. Peer env block: diag(Z_pe'Z_pe) + σ²_e/σ²_pe
+    if model.peer_env
+        λ_pe = model.σ2_e / model.σ2_pe
+        rng = lay.pe
+        @inbounds for k in eachindex(model.pe_data_diag)
+            d[rng[k]] = model.pe_data_diag[k] + λ_pe
         end
     end
 

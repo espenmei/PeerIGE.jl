@@ -114,4 +114,98 @@ end
     end
 end
 
+# ---------- Test 4: peer env block (with ψ dilution + classroom env) ----------
+# Dense reference: W = [X Z_d Z_s Z_h Z_pe], Z_pe = Z_s[:, pe_ids],
+# LHS = W'W + blockdiag(0, σ²_e G⁻¹⊗A⁻¹, (σ²_e/σ²_h) I, (σ²_e/σ²_pe) I).
+@testset "peer env: MME operator, RHS, Px, V_pe and diag preconditioner" begin
+    Random.seed!(7)
+    X = hcat(ones(n), randn(n))
+    nf = size(X, 2)
+    A = Matrix{Float64}(I, N, N) .+ 0.05 * (rand(N, N) .- 0.5)
+    A = (A + A') / 2 + N * I
+    Ainv_dense = inv(A)
+    Ainv = sparse(Ainv_dense)
+    L_Ainv = LowerTriangular(sparse(cholesky(Symmetric(Ainv_dense)).L))
+
+    σ2_d = 1.2; σ2_s = 0.4; σ_ds = 0.15; σ2_e = 1.3; σ2_h = 0.6; σ2_pe = 0.25
+    env = copy(gs.obs_to_group)
+    y = randn(n)
+    model = SGEModel(y, X, Ainv, L_Ainv, gs, σ2_d, σ2_s, σ_ds, σ2_e;
+        env_ids=[env], σ2_env=[σ2_h], ψ=0.5, peer_env=true, σ2_pe=σ2_pe)
+    lay = model.layout
+    @test sort(model.pe_ids) == collect(1:N)
+    @test length(lay.pe) == N && last(lay.pe) == lay.dim
+
+    Zs_psi = copy(Zs_dense)
+    for i in 1:n
+        Zs_psi[i, :] .*= model.group_scale[gs.obs_to_group[i]]
+    end
+    Z_d = zeros(n, N)
+    for (i, id) in enumerate(obs_to_id); Z_d[i, id] = 1.0; end
+    Z_h = zeros(n, maximum(env))
+    for i in 1:n; Z_h[i, env[i]] = 1.0; end
+    Z_pe = Zs_psi[:, model.pe_ids]
+    W = hcat(X, Z_d, Zs_psi, Z_h, Z_pe)
+    @test size(W, 2) == lay.dim
+
+    G = [σ2_d σ_ds; σ_ds σ2_s]
+    LHS = W' * W
+    LHS[nf+1:nf+2N, nf+1:nf+2N] .+= kron(inv(G), Ainv_dense) .* σ2_e
+    for j in lay.env[1]; LHS[j, j] += σ2_e / σ2_h; end
+    for j in lay.pe; LHS[j, j] += σ2_e / σ2_pe; end
+
+    ws = model_workspace(model)
+    op = make_mme_operator(model, ws)
+    for _ in 1:5
+        v = randn(lay.dim)
+        r_op = zeros(lay.dim)
+        op(r_op, v)
+        @test isapprox(r_op, LHS * v; atol=1e-9, rtol=1e-9)
+    end
+
+    u = randn(n)
+    rhs = zeros(lay.dim)
+    build_rhs!(rhs, u, model, ws)
+    @test isapprox(rhs, W' * u; atol=1e-10)
+
+    sol = randn(lay.dim)
+    Px = zeros(n)
+    compute_Px_from_sol!(Px, model, y, sol, ws)
+    @test isapprox(Px, (y - W * sol) ./ σ2_e; atol=1e-10)
+
+    out = zeros(n)
+    get_Vi_u!(out, u, VarianceComponent(VC_PE, 0), model, ws)
+    @test isapprox(out, Z_pe * (Z_pe' * u); atol=1e-10)
+
+    Pd = get_diag_preconditioner(model)
+    @test isapprox(1.0 ./ Pd.inv_diag[lay.pe], diag(LHS)[lay.pe]; atol=1e-10)
+
+    # Block preconditioner applies the same diagonal on the pe block
+    Pb = get_preconditioner(model, ws)
+    r = randn(lay.dim)
+    z = zeros(lay.dim)
+    ldiv!(z, Pb, r)
+    @test isapprox(z[lay.pe], r[lay.pe] ./ diag(LHS)[lay.pe]; atol=1e-10)
+
+    # Exact P*y via dense V must match the matrix-free Px path at the exact MME solution
+    V = σ2_e * I + Z_h * Z_h' .* σ2_h + Z_pe * Z_pe' .* σ2_pe +
+        hcat(Z_d, Zs_psi) * kron(G, A) * hcat(Z_d, Zs_psi)'
+    Vinv = inv(V)
+    P = Vinv - Vinv * X * inv(X' * Vinv * X) * X' * Vinv
+    sol_exact = LHS \ (W' * y)
+    compute_Px_from_sol!(Px, model, y, sol_exact, ws)
+    @test isapprox(Px, P * y; atol=1e-8)
+end
+
+@testset "peer_env=false keeps the original layout" begin
+    X = hcat(ones(n), randn(n))
+    A = Matrix{Float64}(I, N, N) * (N + 1.0)
+    Ainv = sparse(inv(A))
+    L_Ainv = LowerTriangular(sparse(cholesky(Symmetric(Matrix(Ainv))).L))
+    m0 = SGEModel(randn(n), X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)
+    @test isempty(m0.layout.pe) && m0.layout.dim == 2 + 2N
+    @test get_params(m0) == [1.0, 0.2, 0.0, 2.0]
+    @test_throws AssertionError SGEModel(randn(n), X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0; peer_env=true)
+end
+
 println("[operator-identity] all tests passed.")

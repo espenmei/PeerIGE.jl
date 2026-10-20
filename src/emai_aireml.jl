@@ -14,7 +14,19 @@ function get_variance_components(model::SGEModel)
     for h in 1:length(model.env_ids)
         push!(comps, VarianceComponent(VC_ENV, h))
     end
+    if model.peer_env
+        push!(comps, VarianceComponent(VC_PE, 0))
+    end
     return comps
+end
+
+function get_param_names(model::SGEModel)
+    names = ["σ²_d", "σ²_s", "σ_ds", "σ²_e"]
+    for h in 1:length(model.env_ids)
+        push!(names, "σ²_env$h")
+    end
+    model.peer_env && push!(names, "σ²_pe")
+    return names
 end
 
 function compute_score_and_ai(model::SGEModel, Py, z_list, Pz_list, workspaces, preconditioners;
@@ -144,6 +156,11 @@ struct AiRemlResult
     # Mapping: obs → stamtavle-ID (for å koble BLUP til individer)
     obs_to_id::Vector{Int}
     ψ::Float64                 # Dilution exponent used for this fit
+    # Social peer environmental effect (σ²_pe = 0 and empty vectors when peer_env=false)
+    peer_env::Bool
+    σ2_pe::Float64
+    p_env::Vector{Float64}     # Peer env BLUPs, one per roster member
+    pe_ids::Vector{Int}        # Pedigree ID for each entry of p_env
 end
 
 function save_results(result::AiRemlResult, filename::String)
@@ -173,6 +190,9 @@ function update_params!(model::SGEModel, delta, damping)
     for h in 1:length(model.σ2_env)
         model.σ2_env[h] = max(1e-6, model.σ2_env[h] + damping * delta[4+h])
     end
+    if model.peer_env
+        model.σ2_pe = max(1e-6, model.σ2_pe + damping * delta[pe_param_index(model)])
+    end
 end
 
 # Draw k fixed Gaussian probe vectors z_j ∈ ℝⁿ for the Hutchinson trace
@@ -195,11 +215,8 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     N = size(model.Ainv, 1)
     dim = length(model.sol_y)
     H = length(model.env_ids)
-    n_p = 4 + H
-    param_names = ["σ²_d", "σ²_s", "σ_ds", "σ²_e"]
-    for h in 1:H
-        push!(param_names, "σ²_env$h")
-    end
+    param_names = get_param_names(model)
+    n_p = length(param_names)
 
     nt = Threads.nthreads()
     max_tid = Threads.maxthreadid()   # Julia 1.12: threadid() kan returnere > nthreads()
@@ -229,8 +246,10 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     use_log = !isempty(log_file)
     if use_log
         open(log_file, "w") do io
-            param_cols = join(["s2d","s2s","sds","s2e", ["s2env$h" for h in 1:H]...], ",")
-            se_cols = join(["se_d","se_s","se_ds","se_e", ["se_env$h" for h in 1:H]...], ",")
+            pe_cols = model.peer_env ? ",s2pe" : ""
+            pe_se_cols = model.peer_env ? ",se_pe" : ""
+            param_cols = join(["s2d","s2s","sds","s2e", ["s2env$h" for h in 1:H]...], ",") * pe_cols
+            se_cols = join(["se_d","se_s","se_ds","se_e", ["se_env$h" for h in 1:H]...], ",") * pe_se_cols
             println(io, "iter,time_y,time_z,time_ai,time_total,cum_time,eta_min,",
                 param_cols, ",", se_cols, ",",
                 "score_norm,conv_crit,alpha,rho_ds,cond_G,converged")
@@ -296,10 +315,11 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
         # 4. Løs systemet og beregn Standardfeil (SE)
         AI_reg = AI + 1e-6 * I
         delta = AI_reg \ score
-        se = sqrt.(abs.(diag(inv(AI_reg))))
+        AI_inv = inv(AI_reg)
+        se = sqrt.(abs.(diag(AI_inv)))
 
         # 5. Lagre gamle verdier for utskrift
-        old_params = vcat([model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e], model.σ2_env)
+        old_params = get_params(model)
 
         # 6. Step-halving: finn steglengde som holder alle varianser > 0 og G positiv definitt
         α = damping
@@ -309,7 +329,8 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
             new_ds = model.σ_ds + α * delta[3]
             new_e = model.σ2_e + α * delta[4]
             env_ok = all(model.σ2_env[h] + α * delta[4+h] > 1e-8 for h in 1:H)
-            if new_d > 1e-6 && new_s > 1e-8 && new_e > 1e-4 && new_d * new_s > new_ds^2 && env_ok
+            pe_ok = !model.peer_env || model.σ2_pe + α * delta[pe_param_index(model)] > 1e-8
+            if new_d > 1e-6 && new_s > 1e-8 && new_e > 1e-4 && new_d * new_s > new_ds^2 && env_ok && pe_ok
                 break
             end
             α *= 0.5
@@ -317,7 +338,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
 
         # 7. Oppdater parametere med safe steglengde
         update_params!(model, delta, α)
-        new_params = vcat([model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e], model.σ2_env)
+        new_params = get_params(model)
         actual_change = new_params .- old_params
 
         # --- UTSKRIFT ---
@@ -357,6 +378,17 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
             print("  ⚠ dårlig kondisjonert!")
         end
         println()
+        if model.peer_env
+            # Sampling-korrelasjoner fra AI⁻¹: σ²_pe er nært konfundert med σ²_s og gruppe-env
+            ip = pe_param_index(model)
+            print("corr(σ²_pe, ·):")
+            for i in 1:n_p
+                i == ip && continue
+                r = AI_inv[ip, i] / sqrt(abs(AI_inv[ip, ip] * AI_inv[i, i]))
+                @printf("  %s=%+.2f", param_names[i], r)
+            end
+            println()
+        end
 
         # Konvergens-sjekk
         conv_crit = norm(actual_change) / norm(old_params)
@@ -408,6 +440,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     for h in 1:H
         push!(c_env, model.sol_y[lay.env[h]])
     end
+    p_env = model.sol_y[lay.pe]
 
     # Beregn endelig AI og SE
     AI_final = AI + 1e-6 * I
@@ -418,7 +451,8 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
         beta, a_d, a_s, c_env,
         AI, se_final,
         conv_crit < 1e-5, last_iter, n, N, k,
-        copy(model.groups.obs_to_id), model.ψ
+        copy(model.groups.obs_to_id), model.ψ,
+        model.peer_env, model.peer_env ? model.σ2_pe : 0.0, p_env, copy(model.pe_ids)
     )
     return result
 end

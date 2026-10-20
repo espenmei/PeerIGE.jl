@@ -71,8 +71,10 @@ function GroupStructure(group_ids::Vector{Int}, animal_ids::Vector{Int}, N_pedig
         obs_count_per_group, is_observed)
 end
 
-# Blokk-oppsett for løsningsvektoren: [faste (nf) | direkte (N) | sosiale (N) | env1 (n_h1) | env2 ...]
+# Blokk-oppsett for løsningsvektoren:
+#   [faste (nf) | direkte (N) | sosiale (N) | env1 (n_h1) | env2 ... | peer env (n_pe)]
 # Bygges én gang ved modellkonstruksjon; UnitRange-feltene er immutable og allokerer ikke i hot loops.
+# `pe` er en tom range når modellen ikke har sosial peer-miljøeffekt.
 struct SolutionLayout
     nf::Int
     N::Int
@@ -80,10 +82,11 @@ struct SolutionLayout
     direct::UnitRange{Int}
     social::UnitRange{Int}
     env::Vector{UnitRange{Int}}
+    pe::UnitRange{Int}
     dim::Int
 end
 
-function SolutionLayout(nf::Int, N::Int, env_n_levels::AbstractVector{Int})
+function SolutionLayout(nf::Int, N::Int, env_n_levels::AbstractVector{Int}, n_pe::Int=0)
     fixed = 1:nf
     direct = (nf+1):(nf+N)
     social = (nf+N+1):(nf+2N)
@@ -93,7 +96,9 @@ function SolutionLayout(nf::Int, N::Int, env_n_levels::AbstractVector{Int})
         env[h] = (off+1):(off+n_h)
         off += n_h
     end
-    return SolutionLayout(nf, N, fixed, direct, social, env, off)
+    pe = (off+1):(off+n_pe)
+    off += n_pe
+    return SolutionLayout(nf, N, fixed, direct, social, env, pe, off)
 end
 
 # Varianskomponent-identifikator brukt i score/AI og Vi*u.
@@ -103,6 +108,7 @@ const VC_S = UInt8(2)
 const VC_DS = UInt8(3)
 const VC_E = UInt8(4)
 const VC_ENV = UInt8(5)
+const VC_PE = UInt8(6)
 
 struct VarianceComponent
     kind::UInt8
@@ -130,6 +136,21 @@ mutable struct SGEModel
     ψ::Float64                # Dilution exponent: social peer sum scaled by (m_g-1)^{-ψ}
     group_scale::Vector{Float64}  # Per-group dilution factor; 1.0 when ψ=0, 0.0 when m_g<=1
     layout::SolutionLayout    # Blokk-ranges for løsningsvektoren (bygges én gang)
+    # Social peer environmental effect p ~ N(0, σ²_pe I) over roster members, entering
+    # y_i via the same (diluted, self-excluded) peer sum as a_s: Z_s p. Uncorrelated with e.
+    peer_env::Bool
+    σ2_pe::Float64
+    pe_ids::Vector{Int}           # pedigree ID for each pe level (1..n_pe), roster members
+    pe_data_diag::Vector{Float64} # diag(Z_pe'Z_pe) = c_g²(o_g - is_observed); for preconditioners
+end
+
+# Indeks for σ²_pe i parameter-/score-/AI-vektoren: [d, s, ds, e, env_1..env_H, pe]
+pe_param_index(model::SGEModel) = 5 + length(model.env_ids)
+
+function get_params(model::SGEModel)
+    p = vcat([model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e], model.σ2_env)
+    model.peer_env && push!(p, model.σ2_pe)
+    return p
 end
 
 # Beregner total dimensjon for løsningsvektoren
@@ -137,12 +158,13 @@ get_dim(model::SGEModel) = model.layout.dim
 
 function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
     env_ids::Vector{Vector{Int}}=Vector{Int}[], σ2_env::Vector{Float64}=Float64[],
-    ψ::Float64=0.0)
+    ψ::Float64=0.0, peer_env::Bool=false, σ2_pe::Float64=0.0)
     N = size(Ainv, 1)
     n = length(y)
     nf = size(X, 2)
     H = length(env_ids)
     @assert length(σ2_env) == H "env_ids and σ2_env must have same length"
+    @assert !peer_env || σ2_pe > 0 "peer_env=true requires a positive starting value σ2_pe"
 
     # Valider og precompute env
     env_n_levels = Int[]
@@ -160,16 +182,51 @@ function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
         push!(env_counts, counts)
     end
 
-    dim = nf + 2N + sum(env_n_levels)
-    sol_y = zeros(dim)
-    sol_z = Vector{Vector{Float64}}()  # Allokeres av run_aireml
     group_scale = [length(m) <= 1 ? 0.0 : (ψ == 0.0 ? 1.0 : Float64(length(m) - 1)^(-ψ))
                    for m in groups.members_id]
-    layout = SolutionLayout(nf, N, env_n_levels)
+
+    pe_ids = Int[]
+    pe_data_diag = Float64[]
+    if peer_env
+        pe_ids, pe_data_diag = build_peer_env_levels(groups, group_scale)
+        warn_peer_env_identification(groups, group_scale)
+    end
+
+    layout = SolutionLayout(nf, N, env_n_levels, length(pe_ids))
+    sol_y = zeros(layout.dim)
+    sol_z = Vector{Vector{Float64}}()  # Allokeres av run_aireml
     return SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e,
         env_ids, env_n_levels, env_counts, σ2_env,
         sol_y, sol_z,
-        ψ, group_scale, layout)
+        ψ, group_scale, layout,
+        peer_env, σ2_pe, pe_ids, pe_data_diag)
+end
+
+# One pe level per roster member (all members of all groups, incl. missing-outcome members).
+# Z_pe = Z_s[:, pe_ids], so diag(Z_pe'Z_pe)[k] = c_g²·(o_g − is_observed[id]) for m_g ≥ 2.
+function build_peer_env_levels(gs::GroupStructure, group_scale::Vector{Float64})
+    pe_ids = reduce(vcat, gs.members_id)
+    @assert allunique(pe_ids) "peer_env requires each roster member to appear once (duplicate roster rows found)"
+    pe_data_diag = Vector{Float64}(undef, length(pe_ids))
+    for (k, id) in enumerate(pe_ids)
+        g = gs.id_to_group[id]
+        o_g = gs.obs_count_per_group[g]
+        pe_data_diag[k] = length(gs.members_id[g]) > 1 ?
+            group_scale[g]^2 * (o_g - (gs.is_observed[id] ? 1 : 0)) : 0.0
+    end
+    return pe_ids, pe_data_diag
+end
+
+# σ²_pe adds c_g²(m_g−2)·σ²_pe to the covariance of two observed peers in group g, the same
+# shape as a group-level (classroom) variance σ²_class. With a classroom effect in the model,
+# σ²_pe is identified only through between-group variation in c_g²(m_g−2).
+function warn_peer_env_identification(gs::GroupStructure, group_scale::Vector{Float64})
+    coefs = [group_scale[g]^2 * (length(gs.members_id[g]) - 2)
+             for g in eachindex(gs.members_id) if gs.obs_count_per_group[g] >= 2]
+    if isempty(coefs) || mean(coefs) <= 0 || std(coefs) / mean(coefs) < 0.05
+        @warn "peer_env: little or no variation in c_g²(m_g−2) across groups; σ²_pe is " *
+              "confounded with σ²_e and any group-level env variance on the same groups."
+    end
 end
 
 function load_observed_data(yX::DataFrame;

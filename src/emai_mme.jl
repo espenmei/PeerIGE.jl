@@ -54,16 +54,27 @@ function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::V
     beta = @view sol_vector[lay.fixed]
     a_d = @view sol_vector[lay.direct]
     a_s = @view sol_vector[lay.social]
+    # Med peer env: Z_s a_s + Z_pe p = Z_s (a_s + scatter(p)); bygg summen i ws.tmp_N1
+    if model.peer_env
+        soc = ws.tmp_N1
+        copyto!(soc, a_s)
+        p = @view sol_vector[lay.pe]
+        @inbounds for (k, id) in enumerate(model.pe_ids)
+            soc[id] += p[k]
+        end
+    else
+        soc = a_s
+    end
 
     # 2. Beregn y_hat in-place i out, deretter Px
     mul!(out, model.X, beta)
-    # Cache group_sum for a_s så vi unngår å summere medlemmer per obs
-    compute_group_sums!(ws.group_sum, a_s, gs.members_id)
+    # Cache group_sum for soc så vi unngår å summere medlemmer per obs
+    compute_group_sums!(ws.group_sum, soc, gs.members_id)
     @inbounds for i in 1:n
         target_id = gs.obs_to_id[i]
         out[i] += a_d[target_id]
         g_idx = gs.obs_to_group[i]
-        out[i] += (ws.group_sum[g_idx] - a_s[target_id]) * model.group_scale[g_idx]  # scaled peer sum (excl. self)
+        out[i] += (ws.group_sum[g_idx] - soc[target_id]) * model.group_scale[g_idx]  # scaled peer sum (excl. self)
     end
 
     # + env contributions: Zh * ch
@@ -215,20 +226,43 @@ function (op::MMEOperator{T})(res, v) where T
     end
 
     # 2. SOSIALE EFFEKTER (res_s)
+    # Med peer env: Z_s v_s + Z_pe v_pe = Z_s w, w = v_s + scatter(v_pe) (Z_pe = Z_s[:, pe_ids]).
+    # w lagres i op.Ad, som ikke brukes før apply_GinvAinv! overskriver den i steg 6.
+    if m.peer_env
+        v_pe = @view(v[lay.pe])
+        v_soc = op.Ad
+        copyto!(v_soc, v_s)
+        @inbounds for (k, id) in enumerate(m.pe_ids)
+            v_soc[id] += v_pe[k]
+        end
+    else
+        v_soc = v_s
+    end
     # Krydsledd: Zs' * y_hat  (X*v_f + Zd*v_d + sum Zh*v_h) — ingen re-beregning
     apply_Zs_transpose!(res_s, y_hat, gs, op.group_sum, m.group_scale)
-    # Ledd: Zs' * Zs * vs
-    apply_ZsZs_accumulate!(res_s, v_s, gs, m.group_scale)
+    # Ledd: Zs' * Zs * w
+    apply_ZsZs_accumulate!(res_s, v_soc, gs, m.group_scale)
 
-    # 3. Fullfør y_hat: legg til Zs * v_s (gjenbruker workspace_n2)
+    # 3. Fullfør y_hat: legg til Zs * w (gjenbruker workspace_n2)
     tmp_zs = op.workspace_n2
     fill!(tmp_zs, zero(T))
-    # Cache group_sum for v_s
-    compute_group_sums!(op.group_sum, v_s, gs.members_id)
+    # Cache group_sum for w
+    compute_group_sums!(op.group_sum, v_soc, gs.members_id)
     @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
-        tmp_zs[i] = (op.group_sum[gs.obs_to_group[i]] - v_s[target_id]) * m.group_scale[gs.obs_to_group[i]]
+        tmp_zs[i] = (op.group_sum[gs.obs_to_group[i]] - v_soc[target_id]) * m.group_scale[gs.obs_to_group[i]]
     end
     y_hat .+= tmp_zs
+
+    # 3b. PEER ENV: res_pe = Z_pe' * y_hat + (σ²_e/σ²_pe) v_pe. Datadelen er lik res_s
+    # i roster-ID-ene, og må hentes FØR genetisk prior legges til res_s i steg 6.
+    if m.peer_env
+        λ_pe = m.σ2_e / m.σ2_pe
+        res_pe = @view(res[lay.pe])
+        v_pe = @view(v[lay.pe])
+        @inbounds for (k, id) in enumerate(m.pe_ids)
+            res_pe[k] = res_s[id] + λ_pe * v_pe[k]
+        end
+    end
 
     # 4. FASTE EFFEKTER (res_f = X' * y_hat)
     mul!(res_f, m.X', y_hat)
@@ -269,6 +303,14 @@ function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGE
         @inbounds rhs[nf+model.groups.obs_to_id[i]] += v[i]
     end
     apply_Zs_transpose!(@view(rhs[lay.social]), v, model.groups, ws.group_sum, model.group_scale)
+    if model.peer_env
+        # Z_pe' v = (Z_s' v)[pe_ids]
+        rhs_s = @view(rhs[lay.social])
+        rhs_pe = @view(rhs[lay.pe])
+        @inbounds for (k, id) in enumerate(model.pe_ids)
+            rhs_pe[k] = rhs_s[id]
+        end
+    end
     for h in 1:length(model.env_ids)
         ids = model.env_ids[h]
         rhs_h = @view(rhs[lay.env[h]])
@@ -363,6 +405,14 @@ function get_Vi_u!(out::Vector{Float64}, u_n, comp::VarianceComponent, model::SG
         compute_group_sums!(ws.group_sum, ws.tmp_N2, gs.members_id)
         @inbounds for (i, tid) in enumerate(gs.obs_to_id)
             out[i] += (ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N2[tid]) * model.group_scale[gs.obs_to_group[i]]
+        end
+
+    elseif kind == VC_PE # Z_pe * Z_pe' * u = Zs_ψ * Zs_ψ' * u (Zs-kolonner utenfor roster er null)
+        fill!(ws.tmp_N1, 0.0)
+        apply_Zs_transpose!(ws.tmp_N1, u_n, gs, ws.group_sum, model.group_scale)
+        compute_group_sums!(ws.group_sum, ws.tmp_N1, gs.members_id)
+        @inbounds for (i, tid) in enumerate(gs.obs_to_id)
+            out[i] = (ws.group_sum[gs.obs_to_group[i]] - ws.tmp_N1[tid]) * model.group_scale[gs.obs_to_group[i]]
         end
 
     elseif kind == VC_E

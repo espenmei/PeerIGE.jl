@@ -75,6 +75,17 @@ The runner expects two CSV files in the working directory:
 
 Additional columns (e.g. `household`, `classroom`, `school`) in `yX_obs.csv` are used for shared environment models. Covariates included in `X` are configured via `X_COLS` at the top of `run_emai.jl`.
 
+## Optional Social Peer Environmental Effect
+
+`SGEModel(...; peer_env=true, σ2_pe=0.05)` adds a non-genetic peer effect $p_j \sim N(0, \sigma^2_{pe})$ for every roster member. It enters peers' outcomes through the same diluted, self-excluding peer sum as `a_s`, with no covariance with the residual. It is typically fitted together with a classroom effect on the same groups:
+
+```julia
+model = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.05, 0.0, 2.0;
+    env_ids=[classroom_ids], σ2_env=[0.3], peer_env=true, σ2_pe=0.05)
+```
+
+`σ²_pe` is the last parameter in the score/AI/SE vectors and appears as `s2pe`/`se_pe` in the iteration log. `AiRemlResult` adds `σ2_pe`, `p_env` (BLUPs) and `pe_ids` (pedigree ID per BLUP). Against a classroom effect it is identified only through class-size variation, and against `σ2_s` only through relatedness. See `computational_approach.md` §1.7.
+
 ## Current Working Assumptions
 
 - Julia 1.12

@@ -195,6 +195,18 @@ function update_params!(model::SGEModel, delta, damping)
     end
 end
 
+function adapt_damping(α::Float64, step_crit::Float64, previous_step_crit::Float64;
+    enabled::Bool=true)
+    if !enabled || !isfinite(previous_step_crit)
+        return α
+    elseif step_crit < 0.9 * previous_step_crit
+        return min(1.0, 1.5 * α)
+    elseif step_crit > 1.1 * previous_step_crit
+        return max(1e-4, 0.5 * α)
+    end
+    return α
+end
+
 # Draw k fixed Gaussian probe vectors z_j ∈ ℝⁿ for the Hutchinson trace
 # estimator tr(P*V_i) ≈ (1/k) Σ_j z_j' (V_i (P z_j)). Seeding here keeps the
 # probes deterministic and identical across every iteration of run_aireml,
@@ -209,8 +221,11 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     cg_reltol_early=1e-5, cg_early_iters=3,
     ai_maxiter=500, ai_reltol=1e-5,
     use_block_precond=true, verbose_cg=true,
+    adaptive_damping::Bool=true,
     log_file::String="",
     seed::Int=42)
+    isfinite(damping) && damping > 0 ||
+        throw(ArgumentError("damping must be finite and positive"))
     n = length(model.y)
     N = size(model.Ainv, 1)
     dim = length(model.sol_y)
@@ -235,6 +250,9 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     # Workspaces for CG-solves og trace-estimering: ett per tråd (indeksert med threadid())
     workspaces = create_thread_workspaces(model, max_tid)
 
+    factor_error = validate_pedigree_factor(model, workspaces[1])
+    @printf("Pedigree factor check: max relative residual=%.2e\n", factor_error)
+
     precond_name = use_block_precond ? "Block" : "Diag"
     println("Starter AI-REML: k=$k, damping=$damping, precond=$precond_name, cg_maxiter=$cg_maxiter, threads=$nt")
     println("CG reltol schedule: early=$cg_reltol_early (iter <= $cg_early_iters), late=$cg_reltol")
@@ -252,14 +270,16 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
             se_cols = join(["se_d","se_s","se_ds","se_e", ["se_env$h" for h in 1:H]...], ",") * pe_se_cols
             println(io, "iter,time_y,time_z,time_ai,time_total,cum_time,eta_min,",
                 param_cols, ",", se_cols, ",",
-                "score_norm,conv_crit,alpha,rho_ds,cond_G,converged")
+                "score_norm,step_crit,alpha,rho_ds,cond_G,converged")
         end
         println("Iterasjonslogg skrives til: $log_file")
     end
 
     # Variabler som trengs etter loopen (for AiRemlResult)
     AI = zeros(n_p, n_p)
-    conv_crit = Inf
+    step_crit = Inf
+    previous_step_crit = Inf
+    alpha_next = min(Float64(damping), 1.0)
     last_iter = 0
     iter_times = Float64[]   # for ETA-beregning
     t_start_total = time()
@@ -321,8 +341,11 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
         # 5. Lagre gamle verdier for utskrift
         old_params = get_params(model)
 
-        # 6. Step-halving: finn steglengde som holder alle varianser > 0 og G positiv definitt
-        α = damping
+        # 6. Step-halving: finn steglengde som holder alle varianser > 0 og G positiv definitt.
+        # Må ikke erstattes av ren komponentvis projeksjon i update_params!: et overskytende
+        # AI-steg sender da flere varianser til gulvet i én iterasjon, og AI-REML klatrer
+        # deretter bare ca. faktor (1+α) per iterasjon tilbake (scorer i millioner).
+        α = alpha_next
         for _attempt in 1:20
             new_d = model.σ2_d + α * delta[1]
             new_s = model.σ2_s + α * delta[2]
@@ -336,7 +359,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
             α *= 0.5
         end
 
-        # 7. Oppdater parametere med safe steglengde
+        # 7. Oppdater parametere med safe steglengde (update_params! gulv er siste skanse)
         update_params!(model, delta, α)
         new_params = get_params(model)
         actual_change = new_params .- old_params
@@ -390,9 +413,13 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
             println()
         end
 
-        # Konvergens-sjekk
-        conv_crit = norm(actual_change) / norm(old_params)
-        @printf("|score|=%.4e  Δparam=%.6f", score_norm, conv_crit)
+        # Use the undamped AI correction in units of its estimated standard errors;
+        # a tiny feasible/damped step alone is not evidence of convergence.
+        step_crit = maximum(abs.(delta) ./ max.(se, eps()))
+        relative_change = norm(actual_change) / norm(old_params)
+        converged = isfinite(step_crit) && step_crit < 1e-2
+        @printf("|score|=%.4e  Δparam=%.6f  max|Δ|/SE=%.3e",
+            score_norm, relative_change, step_crit)
         flush(stdout)
 
         # CSV-logg (med flush for ekstern overvåking)
@@ -403,16 +430,19 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
                 for p in new_params; @printf(io, "%.6f,", p); end
                 for s in se; @printf(io, "%.6f,", s); end
                 @printf(io, "%.6e,%.6e,%.4f,%.4f,%.1f,%s\n",
-                    score_norm, conv_crit, α, rho_ds, cond_G,
-                    conv_crit < 1e-5 ? "true" : "false")
+                    score_norm, step_crit, α, rho_ds, cond_G,
+                    converged ? "true" : "false")
                 flush(io)
             end
         end
 
-        if conv_crit < 1e-5
+        if converged
             println("\n\n✅ AI-REML har konvergert 😄.")
             break
         end
+        alpha_next = adapt_damping(α, step_crit, previous_step_crit;
+            enabled=adaptive_damping)
+        previous_step_crit = step_crit
         println()
         if iter == max_iter
             println("\n⚠️ Maks iterasjoner nådd uten full konvergens.")
@@ -450,7 +480,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
         model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e, copy(model.σ2_env),
         beta, a_d, a_s, c_env,
         AI, se_final,
-        conv_crit < 1e-5, last_iter, n, N, k,
+        isfinite(step_crit) && step_crit < 1e-2, last_iter, n, N, k,
         copy(model.groups.obs_to_id), model.ψ,
         model.peer_env, model.peer_env ? model.σ2_pe : 0.0, p_env, copy(model.pe_ids)
     )

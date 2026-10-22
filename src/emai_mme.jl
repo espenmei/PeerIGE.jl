@@ -328,14 +328,22 @@ function _solve_mme!(dest::Vector{Float64}, source::Vector{Float64}, model::SGEM
     build_rhs!(rhs, source, model, ws)
 
     op = make_mme_operator(model, ws)
-    if verbose
-        _, ch = cg!(dest, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter, log=true)
-        niter = ch.iters
-        final_res = ch.data[:resnorm][end]
-        flag = niter < maxiter ? "✓" : "⚠ MAXITER"
-        @printf("    CG(%s): %d iter, res=%.2e %s\n", label, niter, final_res, flag)
+    _, ch = cg!(dest, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter, log=true)
+    residuals = ch.data[:resnorm]
+    final_res = if isempty(residuals)
+        mul!(ws.op_wdim, op, dest)
+        ws.op_wdim .-= rhs
+        norm(ws.op_wdim)
     else
-        cg!(dest, op, rhs, Pl=P_inv, reltol=reltol, maxiter=maxiter)
+        last(residuals)
+    end
+    if !ch.isconverged
+        @warn "MME CG did not converge; downstream score/AI estimates may be unreliable" label iterations=ch.iters maxiter reltol residual=final_res
+    end
+    if verbose
+        niter = ch.iters
+        flag = ch.isconverged ? "✓" : "⚠ NOT CONVERGED"
+        @printf("    CG(%s): %d iter, res=%.2e %s\n", label, niter, final_res, flag)
     end
     return dest
 end
@@ -355,6 +363,48 @@ function apply_A!(out::Vector{Float64}, L_Ainv, x_N::Vector{Float64}, tmp::Vecto
     ldiv!(L_Ainv, tmp)           # tmp ← L⁻¹ * x_N
     copyto!(out, tmp)
     ldiv!(L_Ainv', out)          # out ← (L')⁻¹ * (L⁻¹ * x_N) = A * x_N
+end
+
+"""
+    validate_pedigree_factor(model, ws; rtol=1e-6)
+
+Check `Ainv*x ≈ L_Ainv*(L_Ainv'*x)` with two fixed random probes, using
+workspace buffers only. Return the largest relative discrepancy, or throw
+if the precision and factor do not agree in the supplied pedigree order.
+This does not verify the external phenotype/roster ID mapping.
+"""
+function validate_pedigree_factor(model::SGEModel, ws::ThreadWorkspace; rtol=1e-6)
+    N = size(model.Ainv, 1)
+    size(model.Ainv) == (N, N) ||
+        throw(DimensionMismatch("Ainv must be square"))
+    size(model.L_Ainv) == (N, N) ||
+        throw(DimensionMismatch("Ainv and L_Ainv must have matching dimensions"))
+    all(i -> isfinite(model.L_Ainv[i, i]) && model.L_Ainv[i, i] > 0, 1:N) ||
+        throw(ArgumentError("L_Ainv must have a finite, positive diagonal"))
+    isfinite(rtol) && rtol > 0 ||
+        throw(ArgumentError("rtol must be finite and positive"))
+
+    rng = MersenneTwister(2026)
+    x, expected, tmp = ws.tmp_N1, ws.tmp_N2, ws.tmp_N3
+    actual = ws.op_Ad
+    max_error = 0.0
+    for _ in 1:2
+        randn!(rng, x)
+        mul!(expected, model.Ainv, x)
+        mul!(tmp, model.L_Ainv', x)
+        mul!(actual, model.L_Ainv, tmp)
+        actual .-= expected
+        relative_error = norm(actual) / norm(expected)
+        if !isfinite(relative_error) || relative_error > rtol
+            throw(ArgumentError(
+                "Ainv and L_Ainv disagree: relative factor residual=$relative_error (tolerance=$rtol). " *
+                "Require Ainv = L_Ainv * L_Ainv' in the same pedigree ID order. " *
+                "Check trimming/reindexing, Cholesky permutations, lower-vs-upper factors, " *
+                "and whether symmetric triplets were mirrored twice."))
+        end
+        max_error = max(max_error, relative_error)
+    end
+    return max_error
 end
 
 # In-place Vi * u — bruker workspace-buffere (trådsikkert og sekvensiellt)

@@ -70,22 +70,21 @@ build_Ainv_triplets_vec = function(block_mat, ng, nper, inv_perm) {
              x = rep(bv, ng))
 }
 
+# Per-block Cholesky in permuted (global) index order, so the factor stays lower
+# triangular and L %*% t(L) equals Ainv in the same order. Permuting a block factor
+# computed in the original order would put entries above the diagonal, which Julia's
+# LowerTriangular silently drops.
 build_L_Ainv_triplets = function(block_mat, ng, nper, inv_perm) {
-  Lblock = t(chol(block_mat))
-  mask = lower.tri(Lblock, diag = TRUE)
-  idx  = which(abs(Lblock) > 0 & mask, arr.ind = TRUE)
-  bi   = idx[, 1]
-  bj   = idx[, 2]
-  bv   = Lblock[idx]
-  nb   = length(bv)
-
-  offsets = rep(seq.int(0L, by = nper, length.out = ng), each = nb)
-  ii_orig = rep(bi, ng) + offsets
-  jj_orig = rep(bj, ng) + offsets
-
-  data.frame(i = inv_perm[ii_orig],
-             j = inv_perm[jj_orig],
-             x = rep(bv, ng))
+  tri = vector("list", ng)
+  for (g in seq_len(ng)) {
+    perm_idx = inv_perm[(g - 1L) * nper + seq_len(nper)]
+    ord      = order(perm_idx)
+    Lblock   = t(chol(block_mat[ord, ord]))
+    idx      = which(abs(Lblock) > 0 & lower.tri(Lblock, diag = TRUE), arr.ind = TRUE)
+    sorted   = perm_idx[ord]
+    tri[[g]] = data.frame(i = sorted[idx[, 1]], j = sorted[idx[, 2]], x = Lblock[idx])
+  }
+  do.call(rbind, tri)
 }
 
 Ainv_triplet  = build_Ainv_triplets_vec(Astruc_inv, ng, nper, inv_perm)

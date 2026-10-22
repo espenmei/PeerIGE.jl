@@ -5,7 +5,7 @@ end
 using Printf
 
 const RECOVERY_DIR = joinpath(@__DIR__, "..", "outputs", "parameter_recovery")
-const RECOVERY_SIM = joinpath(@__DIR__, "..", "sim_parameter_recovery.R")
+const RECOVERY_SIM = joinpath(@__DIR__, "..", "sim", "sim_parameter_recovery.R")
 const RECOVERY_NG = parse(Int, get(ENV, "PARAM_RECOVERY_NG", "5000"))
 const RECOVERY_MISSING_FRAC = parse(Float64, get(ENV, "PARAM_RECOVERY_MISSING_FRAC", "0.10"))
 

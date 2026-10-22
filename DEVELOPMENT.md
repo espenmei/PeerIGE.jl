@@ -58,10 +58,33 @@ Note: z-solves, trace estimation, and AI work are always threaded via the
 - `σ2_pe` must stay positive when `peer_env=true`; with `peer_env=false` the model, layout, and results must be bit-identical to the model without the feature
 - Threaded paths must use thread-local mutable buffers only
 - `A` must never be formed explicitly; apply it through sparse triangular solves
-- Numerical guards like `max(..., 1e-6)` and step-halving are deliberate stability controls
+- Numerical guards like `max(..., 1e-6)` and step-halving are deliberate stability controls. Do not replace step-halving in `run_aireml` by per-component flooring in `update_params!`: an overshooting AI step then sends several variances to their floors in one iteration, after which AI-REML only climbs back by roughly a factor `(1+α)` per iteration (scores in the millions, estimates near zero for many iterations).
+- AI-REML starts with the requested `damping` and adapts the next iteration's step based on progress of the undamped correction in AI-SE units, up to `α=1`. Feasibility step-halving remains active. Convergence uses `max|Δ|/SE < 1e-2`, not only the realized damped change; `adaptive_damping=false` disables the progress-based adjustment.
 - **Each `Threads.@threads :static` block must live in its own dedicated helper function.** Multiple consecutive `@threads` blocks within a single function corrupt each other's closure environments in Julia 1.12 (non-deterministic results). The helpers are: `_threaded_vi_py!`, `_threaded_trace!`, `_threaded_ai_cg!`, `_threaded_ai_matvec!`, `_threaded_z_solves!`.
 
 ## High-Risk Areas
+
+### Diagnosing collapsed variance estimates
+
+- `run_aireml` first checks `Ainv*x ≈ L_Ainv*(L_Ainv'*x)` with two
+  deterministic random probes (relative tolerance `1e-6`). This uses existing
+  workspace buffers and sparse products, not a reconstructed precision or
+  relationship matrix. A mismatch stops the fit: the MME uses `Ainv`, whereas
+  genetic score derivatives and the block preconditioner use `L_Ainv`.
+- After trimming, both inputs must use the same new pedigree order. A permuted
+  Cholesky factor must not be supplied as though it were an unpermuted factor.
+  Observed and roster IDs must also be remapped consistently; the factor check
+  cannot verify these external ID mappings.
+- Every unconverged MME solve now warns, even with `verbose_cg=false`, including
+  probe (`z`) and AI (`direct`) solves. Inspect these warnings before interpreting
+  the scores or changing damping. `ai_maxiter` is separate from `cg_maxiter`.
+- `var(y)` is not the sum of variance parameters: fixed effects, pedigree
+  relatedness, the direct/social covariance, peer counts, and dilution affect
+  the marginal variance. Small social parameters can produce large outcome
+  variance through peer sums.
+- Validate these checks with `julia --threads 8 --project=. tests/test_solver_diagnostics.jl`.
+
+### Numerically sensitive components
 
 - `BlockPreconditioner` and `DiagPreconditioner`
 - `MMEOperator` and its `mul!` overloads

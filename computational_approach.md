@@ -281,13 +281,17 @@ $$\text{AI}_{ij} = \frac{1}{2} \mathbf{y}' P V_i P V_j P \mathbf{y}$$
 
 Computing $P V_j P\mathbf{y}$ requires solving the MME with $V_j P\mathbf{y}$ as the "data" vector — another CG solve. Since $j \in \{1, 2, 3, 4\}$, only **4 CG solves** are needed (not 10), and the 10 elements of the symmetric AI matrix are filled by cheap matrix-vector products $V_i \cdot (\cdot)$ plus dot products.
 
+The tiny dense reference in `tests/test_score_ai.jl` checks every score and AI entry, including classroom and peer-environment components. Scaled coordinate probes give an exact trace, while Gaussian probes are compared using the same probes in the dense reference. An independent finite-difference check of the restricted log-likelihood verifies the score and the identity $\mathrm{AI}=(J+\mathcal{I})/2$, where $J$ is observed information (negative likelihood Hessian) and $\mathcal{I}_{ij}=\tfrac12\operatorname{tr}(P V_i P V_j)$ is Fisher information. AI is not the observed Hessian alone.
+
 ### 3.4 Step-size control
 
 A step-halving safeguard ensures:
 - All variance components remain positive ($\sigma^2_d, \sigma^2_s, \sigma^2_e > 0$)
 - $G$ remains positive definite ($\sigma^2_d \sigma^2_s > \sigma_{ds}^2$)
 
-The step size $\alpha$ starts at the requested damping value and is halved up to 20 times until both conditions are satisfied.
+The step size $\alpha$ starts at the requested `damping` value and is halved up to 20 times until both conditions are satisfied. The floors in `update_params!` are only a last-resort guard. Replacing step-halving by component-wise projection to those floors is unsafe: one overshooting AI step can put several variances on their floors at once, and from far below the optimum the AI step only grows a variance by roughly a factor $(1+\alpha)$ per iteration.
+
+By default, `run_aireml` adapts the next iteration's starting $\alpha$ using the reduction in the largest absolute AI correction measured in its estimated standard errors: it grows $\alpha$ by 1.5 (up to 1.0) when this criterion drops by at least 10%, halves it when the criterion worsens by more than 10%, and otherwise leaves it unchanged. Set `adaptive_damping=false` to retain a fixed starting damping value. The feasibility step-halving remains active either way. This progress-based rule does not guarantee monotone likelihood improvement; the objective is still not evaluated. Convergence is checked using the undamped AI correction in standard-error units (`max|Δ|/SE < 1e-2`), so a tiny damped step alone cannot mark a fit converged.
 
 ## 5. Solving the MME: Conjugate Gradient with Matrix-Free Operator
 

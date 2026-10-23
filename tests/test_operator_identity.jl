@@ -208,4 +208,31 @@ end
     @test_throws AssertionError SGEModel(randn(n), X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0; peer_env=true)
 end
 
+@testset "update_params! floors are a last-resort guard" begin
+    X = hcat(ones(n), randn(n))
+    Ainv = sparse(1.0I, N, N)
+    L_Ainv = LowerTriangular(sparse(1.0I, N, N))
+    model = SGEModel(randn(n), X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
+        env_ids=[copy(gs.obs_to_group)], σ2_env=[0.3], peer_env=true, σ2_pe=0.05)
+    delta = [0.2, -1.0, 0.0, 0.3, 0.4, 0.1]
+
+    update_params!(model, delta, 0.5)
+
+    @test model.σ2_s == 1e-6
+    @test model.σ2_d ≈ 1.1
+    @test model.σ2_e ≈ 2.15
+    @test model.σ2_env[1] ≈ 0.5
+    @test model.σ2_pe ≈ 0.1
+    @test model.σ2_d * model.σ2_s > model.σ_ds^2
+end
+
+@testset "adaptive damping responds to AI-step progress" begin
+    @test adapt_damping(0.2, 0.7, 1.0) ≈ 0.3
+    @test adapt_damping(0.2, 0.95, 1.0) == 0.2
+    @test adapt_damping(0.2, 1.2, 1.0) == 0.1
+    @test adapt_damping(0.8, 0.7, 1.0) == 1.0
+    @test adapt_damping(0.2, 1.2, 1.0; enabled=false) == 0.2
+    @test adapt_damping(1e-4, 1.2, 1.0) == 1e-4
+end
+
 println("[operator-identity] all tests passed.")

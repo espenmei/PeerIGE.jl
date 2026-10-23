@@ -15,7 +15,7 @@ LinearAlgebra.BLAS.set_num_threads(1)
 #   emai_core.jl    — shared types and observed-data / group construction
 #   emai_precond.jl — diagonal and block preconditioners
 #   emai_mme.jl     — matrix-free mixed model equations, CG solves, V_i ops
-#   emai_aireml.jl  — trace probes, score/AI assembly and the run_aireml driver
+#   emai_aireml.jl  — trace probes, score/AI assembly, fitting and snapshots
 # The using/import statements above are shared by every included file.
 # =====================================================================
 

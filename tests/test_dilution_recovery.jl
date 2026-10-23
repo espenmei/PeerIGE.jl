@@ -5,7 +5,7 @@ end
 using Printf
 
 const DILUTION_BASE_DIR = joinpath(@__DIR__, "..", "outputs", "dilution_recovery")
-const DILUTION_SIM = joinpath(@__DIR__, "..", "sim_dilution.R")
+const DILUTION_SIM = joinpath(@__DIR__, "..", "sim", "sim_dilution.R")
 const DILUTION_NG = parse(Int, get(ENV, "DILUTION_RECOVERY_NG", "5000"))
 const DILUTION_MISSING_FRAC = parse(Float64, get(ENV, "DILUTION_RECOVERY_MISSING_FRAC", "0.10"))
 const DILUTION_MAX_ITER = parse(Int, get(ENV, "DILUTION_RECOVERY_MAX_ITER", "15"))

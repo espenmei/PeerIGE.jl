@@ -87,7 +87,7 @@ function simulate_peer_env(; nfam, seed, σ2_d, σ2_s, σ_ds, σ2_e, σ2_class, 
     return (; y=y_all[obs_ids], X, Ainv, L_Ainv, gs, class_ids=gs.obs_to_group, N, n_groups)
 end
 
-pe_truth = (σ2_d=1.0, σ2_s=0.06, σ_ds=0.08, σ2_e=2.0, σ2_class=0.3, σ2_pe=0.04)
+pe_truth = (σ2_d=1.0, σ2_s=0.06, σ_ds=0.08, σ2_e=2.0, σ2_class=0.3, σ2_pe=0.08)
 
 println("[peer-env-recovery] simulating (nfam=$PE_NFAM, seed=$PE_SEED)...")
 sim = simulate_peer_env(; nfam=PE_NFAM, seed=PE_SEED, pe_truth...)

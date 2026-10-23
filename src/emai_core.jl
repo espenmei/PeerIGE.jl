@@ -115,6 +115,38 @@ struct VarianceComponent
     env_idx::Int
 end
 
+Base.@kwdef struct AiRemlSettings
+    max_iter::Int = 15
+    k::Int = 5
+    damping::Float64 = 0.2
+    cg_maxiter::Int = 2000
+    cg_reltol::Float64 = 1e-7
+    cg_reltol_early::Float64 = 1e-5
+    cg_early_iters::Int = 3
+    ai_maxiter::Int = 500
+    ai_reltol::Float64 = 1e-5
+    use_block_precond::Bool = true
+    verbose_cg::Bool = true
+    adaptive_damping::Bool = true
+    log_file::String = ""
+    seed::Int = 42
+end
+
+mutable struct AiRemlFit
+    AI::Matrix{Float64}
+    vcov::Matrix{Float64}
+    se::Vector{Float64}
+    score::Vector{Float64}
+    initial_params::Vector{Float64}
+    ai_params::Vector{Float64}  # AI/score evaluation point, before the last update
+    converged::Bool
+    n_iter::Int
+    step_crit::Float64
+    alpha::Float64
+    settings::AiRemlSettings
+    beta_vcov::Union{Nothing,Matrix{Float64}}
+end
+
 mutable struct SGEModel
     y::Vector{Float64}
     X::Matrix{Float64}
@@ -132,7 +164,6 @@ mutable struct SGEModel
     σ2_env::Vector{Float64}            # H scalar variances
     # Warm start
     sol_y::Vector{Float64}
-    sol_z::Vector{Vector{Float64}} # For Hutchinson trace estimat av Vi * Pz
     ψ::Float64                # Dilution exponent: social peer sum scaled by (m_g-1)^{-ψ}
     group_scale::Vector{Float64}  # Per-group dilution factor; 1.0 when ψ=0, 0.0 when m_g<=1
     layout::SolutionLayout    # Blokk-ranges for løsningsvektoren (bygges én gang)
@@ -142,6 +173,9 @@ mutable struct SGEModel
     σ2_pe::Float64
     pe_ids::Vector{Int}           # pedigree ID for each pe level (1..n_pe), roster members
     pe_data_diag::Vector{Float64} # diag(Z_pe'Z_pe) = c_g²(o_g - is_observed); for preconditioners
+    fixef_names::Vector{String}
+    env_names::Vector{String}
+    fit::Union{Nothing,AiRemlFit}
 end
 
 # Indeks for σ²_pe i parameter-/score-/AI-vektoren: [d, s, ds, e, env_1..env_H, pe]
@@ -158,11 +192,17 @@ get_dim(model::SGEModel) = model.layout.dim
 
 function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
     env_ids::Vector{Vector{Int}}=Vector{Int}[], σ2_env::Vector{Float64}=Float64[],
-    ψ::Float64=0.0, peer_env::Bool=false, σ2_pe::Float64=0.0)
+    ψ::Float64=0.0, peer_env::Bool=false, σ2_pe::Float64=0.0,
+    fixef_names::AbstractVector{<:AbstractString}=["x$j" for j in axes(X, 2)],
+    env_names::AbstractVector{<:AbstractString}=["env$h" for h in eachindex(env_ids)])
     N = size(Ainv, 1)
     n = length(y)
     nf = size(X, 2)
     H = length(env_ids)
+    length(fixef_names) == nf ||
+        throw(DimensionMismatch("fixef_names must contain one name per column of X"))
+    length(env_names) == H ||
+        throw(DimensionMismatch("env_names must contain one name per environment factor"))
     @assert length(σ2_env) == H "env_ids and σ2_env must have same length"
     @assert !peer_env || σ2_pe > 0 "peer_env=true requires a positive starting value σ2_pe"
 
@@ -194,12 +234,12 @@ function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
 
     layout = SolutionLayout(nf, N, env_n_levels, length(pe_ids))
     sol_y = zeros(layout.dim)
-    sol_z = Vector{Vector{Float64}}()  # Allokeres av run_aireml
     return SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e,
         env_ids, env_n_levels, env_counts, σ2_env,
-        sol_y, sol_z,
+        sol_y,
         ψ, group_scale, layout,
-        peer_env, σ2_pe, pe_ids, pe_data_diag)
+        peer_env, σ2_pe, pe_ids, pe_data_diag,
+        String.(fixef_names), String.(env_names), nothing)
 end
 
 # One pe level per roster member (all members of all groups, incl. missing-outcome members).
@@ -265,7 +305,10 @@ function load_observed_data(yX::DataFrame;
     end
 
     obs_to_id = Int.(yX[obs_mask, :id_ped])
-    return (; obs_mask, y, X, obs_to_id)
+    fixef_names = X_df === nothing ?
+        vcat(add_intercept ? ["(Intercept)"] : String[], string.(covariate_cols)) :
+        names(X_df)
+    return (; obs_mask, y, X, obs_to_id, fixef_names)
 end
 
 function build_group_structure(yX::DataFrame, N_pedigree::Int, obs_mask::AbstractVector{Bool})

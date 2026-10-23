@@ -148,8 +148,8 @@ end
                         k = size(Z, 2)
                         z = [Z[:, j] for j in 1:k]
                         Pz = [zeros(n) for _ in 1:k]
-                        model.sol_z = [zeros(get_dim(model)) for _ in 1:k]
-                        _threaded_z_solves!(model, z, Pz, workspaces, preconditioners,
+                        sol_z = [zeros(get_dim(model)) for _ in 1:k]
+                        _threaded_z_solves!(sol_z, model, z, Pz, workspaces, preconditioners,
                             k, 1e-12, 2000)
                         @test maximum(abs.(hcat(Pz...) - P * Z)) < 1e-9
                         score, AI = compute_score_and_ai(model, Py, z, Pz,

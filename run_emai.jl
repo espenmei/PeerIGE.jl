@@ -81,9 +81,10 @@ println("\n" * "="^70)
 println("MODEL 1: Base SGE (σ²_d, σ²_s, σ_ds, σ²_e)")
 println("="^70)
 
-model1 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)
+fixef_names = vcat(["(Intercept)"], string.(X_COLS))
+model1 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0; fixef_names)
 
-@time result1 = run_aireml(
+@time fit_aireml!(
     model1,
     max_iter=25,
     k=20,
@@ -95,7 +96,8 @@ model1 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)
     log_file=joinpath(OUT_LOG_DIR, "aireml_log_base.csv"),
 )
 
-# save_results(result1, joinpath(OUT_RES_DIR, "aireml_result_base.jld2"))  # JLD2 unavailable on offline HPC
+# save_model(model1, joinpath(OUT_RES_DIR, "aireml_model_base.jld2"))  # JLD2 unavailable on offline HPC
+# save_results(snapshot(model1), joinpath(OUT_RES_DIR, "aireml_result_base.jld2"))
 println("Model 1 estimates: σ²_d=$(model1.σ2_d), σ²_s=$(model1.σ2_s), σ_ds=$(model1.σ_ds), σ²_e=$(model1.σ2_e)")
 
 # =====================================================================
@@ -108,9 +110,9 @@ println("="^70)
 @assert hasproperty(obs_table, :household) "Missing column 'household' in yX_obs.csv required for Model 2"
 household_ids = Int.(obs_table[:, :household])
 model2 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
-    env_ids=[household_ids], σ2_env=[0.5])
+    env_ids=[household_ids], σ2_env=[0.5], fixef_names, env_names=["household"])
 
-@time result2 = run_aireml(
+@time fit_aireml!(
     model2,
     max_iter=20,
     k=20,
@@ -122,7 +124,8 @@ model2 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
     log_file=joinpath(OUT_LOG_DIR, "aireml_log_env.csv"),
 )
 
-# save_results(result2, joinpath(OUT_RES_DIR, "aireml_result_env.jld2"))  # JLD2 unavailable on offline HPC
+# save_model(model2, joinpath(OUT_RES_DIR, "aireml_model_env.jld2"))  # JLD2 unavailable on offline HPC
+# save_results(snapshot(model2), joinpath(OUT_RES_DIR, "aireml_result_env.jld2"))
 println("Model 2 estimates: σ²_d=$(model2.σ2_d), σ²_s=$(model2.σ2_s), σ_ds=$(model2.σ_ds), σ²_e=$(model2.σ2_e), σ²_c=$(model2.σ2_env)")
 
 # =====================================================================
@@ -139,9 +142,9 @@ end
 env_ids3 = [Int.(obs_table[:, :household]), Int.(obs_table[:, :classroom]), Int.(obs_table[:, :school])]
 model3 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
     env_ids=env_ids3,
-    σ2_env=[0.5, 0.3, 0.2])
+    σ2_env=[0.5, 0.3, 0.2], fixef_names, env_names=["household", "classroom", "school"])
 
-@time result3 = run_aireml(
+@time fit_aireml!(
     model3,
     max_iter=20,
     k=20,
@@ -153,7 +156,8 @@ model3 = SGEModel(y_obs, X_obs, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
     log_file=joinpath(OUT_LOG_DIR, "aireml_log_env3.csv"),
 )
 
-# save_results(result3, joinpath(OUT_RES_DIR, "aireml_result_env3.jld2"))  # JLD2 unavailable on offline HPC
+# save_model(model3, joinpath(OUT_RES_DIR, "aireml_model_env3.jld2"))  # JLD2 unavailable on offline HPC
+# save_results(snapshot(model3), joinpath(OUT_RES_DIR, "aireml_result_env3.jld2"))
 println("Model 3 estimates: σ²_d=$(model3.σ2_d), σ²_s=$(model3.σ2_s), σ_ds=$(model3.σ_ds), σ²_e=$(model3.σ2_e), σ²_household=$(model3.σ2_env[1]), σ²_classroom=$(model3.σ2_env[2]), σ²_school=$(model3.σ2_env[3])")
 
 # =====================================================================
@@ -163,10 +167,10 @@ println("\n" * "="^70)
 println("COMPARISON")
 println("="^70)
 @printf("%-14s %12s %12s %12s\n", "Parameter", "Base", "+Household", "+Hh+Class+School")
-@printf("%-14s %12.6f %12.6f %12.6f\n", "σ²_d", result1.σ2_d, result2.σ2_d, result3.σ2_d)
-@printf("%-14s %12.6f %12.6f %12.6f\n", "σ²_s", result1.σ2_s, result2.σ2_s, result3.σ2_s)
-@printf("%-14s %12.6f %12.6f %12.6f\n", "σ_ds", result1.σ_ds, result2.σ_ds, result3.σ_ds)
-@printf("%-14s %12.6f %12.6f %12.6f\n", "σ²_e", result1.σ2_e, result2.σ2_e, result3.σ2_e)
-@printf("%-14s %12s %12.6f %12.6f\n", "σ²_household", "—", result2.σ2_env[1], result3.σ2_env[1])
-@printf("%-14s %12s %12s %12.6f\n", "σ²_classroom", "—", "—", result3.σ2_env[2])
-@printf("%-14s %12s %12s %12.6f\n", "σ²_school", "—", "—", result3.σ2_env[3])
+@printf("%-14s %12.6f %12.6f %12.6f\n", "σ²_d", model1.σ2_d, model2.σ2_d, model3.σ2_d)
+@printf("%-14s %12.6f %12.6f %12.6f\n", "σ²_s", model1.σ2_s, model2.σ2_s, model3.σ2_s)
+@printf("%-14s %12.6f %12.6f %12.6f\n", "σ_ds", model1.σ_ds, model2.σ_ds, model3.σ_ds)
+@printf("%-14s %12.6f %12.6f %12.6f\n", "σ²_e", model1.σ2_e, model2.σ2_e, model3.σ2_e)
+@printf("%-14s %12s %12.6f %12.6f\n", "σ²_household", "—", model2.σ2_env[1], model3.σ2_env[1])
+@printf("%-14s %12s %12s %12.6f\n", "σ²_classroom", "—", "—", model3.σ2_env[2])
+@printf("%-14s %12s %12s %12.6f\n", "σ²_school", "—", "—", model3.σ2_env[3])

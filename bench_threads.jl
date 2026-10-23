@@ -44,9 +44,9 @@ bench_settings = (max_iter=10, k=20, damping=0.5,
 function make_model()
     if has_env
         hh = observed_env_ids(obs_table, [:household])[1]
-        SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0; env_ids=[hh], σ2_env=[0.5])
+        SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;         env_ids=[hh], σ2_env=[0.5], fixef_names=obs.fixef_names, env_names=["household"])
     else
-        SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)
+        SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0; fixef_names=obs.fixef_names)
     end
 end
 
@@ -57,7 +57,7 @@ println("-"^70)
 # --- Warmup: JIT compile ---
 print("Warmup... ")
 m_w = make_model()
-run_aireml(m_w; max_iter=1, k=2, damping=0.5, cg_maxiter=200, ai_maxiter=100,
+fit_aireml!(m_w; max_iter=1, k=2, damping=0.5, cg_maxiter=200, ai_maxiter=100,
            verbose_cg=false, seed=42)
 println("done")
 GC.gc()  # clean up warmup allocations
@@ -65,7 +65,7 @@ GC.gc()  # clean up warmup allocations
 # --- Timed run ---
 @printf("\n--- RUN (%d threads) ---\n", Threads.nthreads())
 m = make_model()
-t_run = @elapsed result = run_aireml(m; bench_settings..., log_file=THR_LOG)
+t_run = @elapsed result = fit_aireml!(m; bench_settings..., log_file=THR_LOG)
 @printf("Total: %.2fs  (%d threads)\n", t_run, Threads.nthreads())
 
 # --- Per-iteration timing from CSV log ---
@@ -96,4 +96,4 @@ for h in eachindex(result.σ2_env)
     @printf("%-12s %12.6f\n", "σ²_env$h", result.σ2_env[h])
 end
 println("-"^70)
-println("Converged: $(result.converged) ($(result.n_iter) iter)")
+println("Converged: $(result.fit.converged) ($(result.fit.n_iter) iter)")

@@ -4,6 +4,7 @@
 
 # Julia
 Manifest.toml
+src.zip
 
 # R
 .Rhistory

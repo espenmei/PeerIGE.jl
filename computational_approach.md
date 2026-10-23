@@ -1,5 +1,21 @@
 # Computational Approach: AI-REML for Social Genetic Effects
 
+Implementation entry point: `fit_aireml!(model; ...)` mutates and returns the
+model. Fitting scratch is transient; the model keeps its data, final variance
+components and MME solution, plus AI/score/convergence metadata. An optional
+`snapshot(model)` copies inference outputs without the data and pedigree inputs.
+The compatibility interface `run_aireml` still returns a result snapshot.
+
+Fixed-effect covariance is computed on demand through matrix-free solves.
+For the residual-scaled coefficient operator
+$C_* = \sigma_e^2 C$, solve $C_* u_j = e_j$ for fixed-effect unit vectors.
+Then $\sigma_e^2 [u_j]_{\mathrm{fixed}}$ gives column $j$ of
+$(X'V^{-1}X)^{-1}$. This adds one CG solve per fixed-effect column only when
+requested, not during optimization. Genetic and environmental BLUP
+prediction-error variances are not computed. The stored AI/variance-component
+SEs retain the existing last pre-update evaluation point, recorded as
+`ai_params`; final BLUE/BLUP and fixed-effect covariance use the final parameters.
+
 ## 1. Model
 
 We estimate variance components for a **Social Genetic Effects (SGE)** model applied to school peer effects. For observed individual $i$ in school class (group) $g_i$:

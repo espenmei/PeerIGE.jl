@@ -4,7 +4,7 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## What This Repository Contains
 
-- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), and `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `run_aireml` driver). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects (`σ2_env` for 0–2 grouping factors)
+- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), and `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
 - `run_emai.jl`: runnable entrypoint; fits both the base SGE model and the SGE+household model, prints a comparison table
 - `computational_approach.md`: math and algorithm overview
 - `sim/`: simulation scripts in R (`sim_peer.R`, `sim_peer_evn.R`; `sim_peer_evn.R` adds household/classroom/school shared environment effects); each writes the two-table format (`yX_obs.csv`, `roster.csv`)
@@ -54,15 +54,88 @@ The runner currently:
 1. Loads observed phenotype/design data from `yX_obs.csv` and social group membership from `roster.csv`
 2. Validates required columns and builds `GroupStructure` from the two-table input
 3. Loads `Ainv` and sparse Cholesky inputs from triplet CSV files
-4. Fits **Model 1**: base SGE (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`), saves to `outputs/results/aireml_result_base.jld2`
-5. Fits **Model 2**: SGE + household shared environment, saves to `outputs/results/aireml_result_env.jld2`
+4. Fits **Model 1**: base SGE (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`)
+5. Fits **Model 2**: SGE + household shared environment, and **Model 3**: SGE + household + classroom + school
 6. Prints a side-by-side parameter comparison table
 7. All runs are threaded — start with `--threads 8`
+
+Saving examples in the runner are commented out for the offline HPC environment.
+
+## Fitted Models And Inference Snapshots
+
+The fitted model is the primary object. Supply design-column names when building
+it (`load_observed_data` also returns `fixef_names`):
+
+```julia
+model = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
+    fixef_names=["(Intercept)", "x"])
+fit_aireml!(model; max_iter=25, k=20)  # returns the same model
+
+model.σ2_d                 # fitted variance component
+fixef(model)               # view of beta in the authoritative solution vector
+ranef(model).a_d           # view of pedigree-wide direct BLUPs
+model.fit.se               # variance-component SEs
+model.fit.converged
+model.fit.step_crit
+
+save_model(model, "fitted_model.jld2")
+model = load_model("fitted_model.jld2")
+
+result = snapshot(model)   # independent, no y/X/pedigree matrices or scratch
+save_results(result, "inference_snapshot.jld2")
+result = load_results("inference_snapshot.jld2")
+```
+
+`model.fit` stores AI, regularized variance-component covariance/SEs, score,
+initial parameters, convergence diagnostics, and fit settings. Variance
+components live only on the model and BLUE/BLUPs only in `model.sol_y`; the
+accessors return views, not additional copies. Hutchinson solution buffers
+and thread workspaces are local to fitting and are not retained or saved.
+Refitting requires explicit `fit_aireml!(model; refit=true, ...)` and starts
+from its current estimates. A failed refit clears the previous fit metadata.
+Do not manually change model inputs or parameters after fitting and then use
+cached inference; build/refit the model instead.
+
+A snapshot contains variance components, beta, all BLUPs, fixed-effect and
+environment-factor names, parameter names, observation/pedigree and environment
+mappings, dilution/peer settings, AI/covariance/SEs, and convergence/settings
+metadata. Its arrays are independent of the model.
+
+By default, `snapshot(model)` also includes `beta_vcov` and `beta_se`.
+These require one extra matrix-free CG solve per fixed-effect column, on the
+first request only, and are cached on the model. Call
+`fixed_effect_vcov!(model)` directly to populate this cache without a snapshot,
+or use `snapshot(model; include_fixef_se=false)` to explicitly omit these
+quantities (`nothing`). This optional inference work is not part of fitting.
+Like `fit_aireml!`, `fixed_effect_vcov!` returns the same model, not the matrix:
+
+```julia
+fixed_effect_vcov!(model)
+beta_vcov = model.fit.beta_vcov
+```
+
+BLUP prediction-error variances/reliabilities are **not** computed. A snapshot
+supports inference on stored coefficients and variance components, not arbitrary
+new computations requiring the original design or pedigree; save the full model
+for those.
+
+As before, AI/variance-component SEs are evaluated **before the last parameter
+update**, while the final BLUE/BLUP solve and fixed-effect covariance use the
+returned parameters. `ai_params` records the AI evaluation point explicitly,
+which matters particularly for nonconverged fits. `converged=false` must not be
+ignored when interpreting a snapshot.
+
+`run_aireml(model; ...)` remains compatible: it mutates the model and returns
+an `AiRemlResult` with fixed-effect SEs omitted, preserving its previous cost.
+It allows refitting by default, as before. New code should use `fit_aireml!`.
+The serialized struct layout has changed; existing JLD2 files should be
+re-exported using their original source version rather than assuming cross-version
+struct compatibility.
 
 ## Key Outputs
 
 - `outputs/logs/*.csv`: per-iteration timing, parameter estimates, scores, convergence diagnostics
-- `outputs/results/*.jld2`: serialized `AiRemlResult`/`DirectRemlResult` with estimates, BLUE/BLUP outputs, AI matrix, and standard errors
+- `outputs/results/*.jld2`: optional complete `SGEModel` files or independent `AiRemlResult` snapshots
 
 ## Input File Contract
 

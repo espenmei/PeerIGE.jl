@@ -103,7 +103,7 @@ try
     println("[Smoke test] Test 1: H=0 (no env effects)...")
     model0 = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0)
 
-    result0 = run_aireml(
+    fit_aireml!(
         model0,
         max_iter=MAX_ITER,
         k=K_PROBES,
@@ -114,6 +114,7 @@ try
         log_file=LOG_FILE,
         seed=42,
     )
+    result0 = snapshot(model0; include_fixef_se=false)
 
     check(isfinite(result0.σ2_d), "σ2_d is not finite")
     check(isfinite(result0.σ2_s), "σ2_s is not finite")
@@ -138,7 +139,7 @@ try
     model1 = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
         env_ids=[env1_ids], σ2_env=[0.5])
 
-    result1 = run_aireml(
+    fit_aireml!(
         model1,
         max_iter=MAX_ITER,
         k=K_PROBES,
@@ -149,6 +150,7 @@ try
         log_file=LOG_FILE,
         seed=42,
     )
+    result1 = snapshot(model1; include_fixef_se=false)
 
     check(isfinite(result1.σ2_d), "H=1: σ2_d is not finite")
     check(isfinite(result1.σ2_e), "H=1: σ2_e is not finite")

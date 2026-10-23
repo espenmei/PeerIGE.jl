@@ -187,6 +187,7 @@ function apply_GinvAinv!(out_d, out_s, v_d, v_s, Ainv, λ, Ad, As)
     mul!(As, Ainv, v_s)
     @. out_d += λ[1, 1] * Ad + λ[1, 2] * As
     @. out_s += λ[2, 1] * Ad + λ[2, 2] * As
+    return out_d, out_s
 end
 
 function (op::MMEOperator{T})(res, v) where T
@@ -318,6 +319,7 @@ function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGE
             rhs_h[ids[i]] += v[i]
         end
     end
+    return rhs
 end
 
 # Felles MME-løser: bygg RHS for `source`, kjør CG inn i `dest`.
@@ -349,8 +351,10 @@ function _solve_mme!(dest::Vector{Float64}, source::Vector{Float64}, model::SGEM
 end
 
 # Løser for y (faktiske data)
-solve_mme_y!(model::SGEModel, ws::ThreadWorkspace, P_inv; reltol=1e-7, maxiter=2000, verbose=true) =
+function solve_mme_y!(model::SGEModel, ws::ThreadWorkspace, P_inv; reltol=1e-7, maxiter=2000, verbose=true)
     _solve_mme!(model.sol_y, model.y, model, ws, P_inv; reltol=reltol, maxiter=maxiter, verbose=verbose, label="y")
+    return model
+end
 
 # Løser for z_i (stokastisk trace)
 solve_mme_z!(sol_z_i::Vector{Float64}, model::SGEModel, z_vector::Vector{Float64},
@@ -363,6 +367,7 @@ function apply_A!(out::Vector{Float64}, L_Ainv, x_N::Vector{Float64}, tmp::Vecto
     ldiv!(L_Ainv, tmp)           # tmp ← L⁻¹ * x_N
     copyto!(out, tmp)
     ldiv!(L_Ainv', out)          # out ← (L')⁻¹ * (L⁻¹ * x_N) = A * x_N
+    return out
 end
 
 """

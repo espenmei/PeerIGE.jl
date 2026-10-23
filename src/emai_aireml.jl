@@ -1,7 +1,7 @@
 # =====================================================================
 # AI-REML DRIVER
 # Score and Average Information assembly, parameter updates, the result
-# struct, and the run_aireml iteration loop. Included via emai.jl.
+# struct, and the fit_aireml! iteration loop. Included via emai.jl.
 # =====================================================================
 # Returnerer varianstype-representasjon for gjeldende modell (d, s, ds, e, env_h)
 function get_variance_components(model::SGEModel)
@@ -82,6 +82,7 @@ function _threaded_vi_py!(Vi_Py_list, Py, comps, model, workspaces)
         tid = Threads.threadid()
         get_Vi_u!(Vi_Py_list[i], Py, comps[i], model, workspaces[tid])
     end
+    return Vi_Py_list
 end
 
 function _threaded_trace!(trace_results, n_trace, k, Pz_list, z_list, comps, model, workspaces)
@@ -93,6 +94,7 @@ function _threaded_trace!(trace_results, n_trace, k, Pz_list, z_list, comps, mod
         get_Vi_u!(ws.vi_out, Pz_list[j], comps[i], model, ws)
         trace_results[flat_idx] = dot(z_list[j], ws.vi_out) / k
     end
+    return trace_results
 end
 
 function _threaded_ai_cg!(P_Vi_Py_list, Vi_Py_list, model, workspaces, preconditioners, ai_reltol, ai_maxiter)
@@ -105,6 +107,7 @@ function _threaded_ai_cg!(P_Vi_Py_list, Vi_Py_list, model, workspaces, precondit
             reltol=ai_reltol, maxiter=ai_maxiter)
         compute_Px_from_sol!(P_Vi_Py_list[j], model, Vi_Py_list[j], tmp_sols[j], ws)
     end
+    return P_Vi_Py_list
 end
 
 function _threaded_ai_matvec!(ai_vals, pairs, P_Vi_Py_list, Py, comps, model, workspaces)
@@ -115,17 +118,19 @@ function _threaded_ai_matvec!(ai_vals, pairs, P_Vi_Py_list, Py, comps, model, wo
         get_Vi_u!(ws.vi_out, P_Vi_Py_list[j_idx], comps[i_idx], model, ws)
         ai_vals[idx] = 0.5 * dot(Py, ws.vi_out)
     end
+    return ai_vals
 end
 
-function _threaded_z_solves!(model, z_fixed_list, Pz_list, workspaces, preconditioners,
+function _threaded_z_solves!(sol_z, model, z_fixed_list, Pz_list, workspaces, preconditioners,
     k, cg_reltol, cg_maxiter)
     Threads.@threads :static for i in 1:k
         tid = Threads.threadid()
         ws = workspaces[tid]
-        solve_mme_z!(model.sol_z[i], model, z_fixed_list[i], ws, preconditioners[tid],
+        solve_mme_z!(sol_z[i], model, z_fixed_list[i], ws, preconditioners[tid],
             reltol=cg_reltol, maxiter=cg_maxiter)
-        compute_Px_from_sol!(Pz_list[i], model, z_fixed_list[i], model.sol_z[i], ws)
+        compute_Px_from_sol!(Pz_list[i], model, z_fixed_list[i], sol_z[i], ws)
     end
+    return sol_z
 end
 
 # =====================================================================
@@ -161,6 +166,192 @@ struct AiRemlResult
     σ2_pe::Float64
     p_env::Vector{Float64}     # Peer env BLUPs, one per roster member
     pe_ids::Vector{Int}        # Pedigree ID for each entry of p_env
+    fixef_names::Vector{String}
+    env_names::Vector{String}
+    param_names::Vector{String}
+    env_ids::Vector{Vector{Int}}
+    beta_vcov::Union{Nothing,Matrix{Float64}}
+    beta_se::Union{Nothing,Vector{Float64}}
+    vcov::Matrix{Float64}
+    score::Vector{Float64}
+    initial_params::Vector{Float64}
+    ai_params::Vector{Float64}
+    step_crit::Float64
+    alpha::Float64
+    settings::AiRemlSettings
+end
+
+function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_se,
+    param_names, params, param_se, converged, n_iter, step_crit, alpha;
+    env_names=String[], env_levels=Int[], peer_env=false, ψ=0.0, fitted=true)
+    println(io, "AI-REML fit")
+    println(io, "  Status: ", fitted ? (converged ? "converged" : "not converged") : "not fitted")
+    println(io, "  Data:   ", n_obs, " observations; ", n_pedigree, " pedigree members")
+    println(io, "  Design: ", length(fixef_names), " fixed effects; ",
+        length(env_names), " shared environment factor(s)",
+        peer_env ? "; peer environment enabled" : "")
+    if !isempty(env_names)
+        println(io, "  Environment levels: ",
+            join(["$(env_names[i])=$(env_levels[i])" for i in eachindex(env_names)], ", "))
+    end
+    if fitted
+        println(io, "  Fit:    ", n_iter, " iteration(s); α=", @sprintf("%.3g", alpha),
+            "; max|Δ|/SE=", @sprintf("%.3g", step_crit))
+        println(io, "  ψ:      ", ψ)
+        println(io)
+        println(io, "Variance components")
+        println(io, "  ", rpad("Component", 18), lpad("Estimate", 14), lpad("SE", 14))
+        for i in eachindex(param_names)
+            print(io, "  ", rpad(param_names[i], 18),
+                lpad(@sprintf("%.6g", params[i]), 14))
+            if i <= length(param_se)
+                println(io, lpad(@sprintf("%.6g", param_se[i]), 14))
+            else
+                println(io, lpad("not available", 14))
+            end
+        end
+
+        if !isempty(fixef_names)
+            println(io)
+            println(io, "Fixed effects")
+            println(io, "  ", rpad("Name", 24), lpad("Estimate", 14), lpad("SE", 14))
+            max_rows = max(1, min(12, displaysize(io)[1] - 18))
+            n_show = min(length(fixef_names), max_rows)
+            for i in 1:n_show
+                print(io, "  ", rpad(fixef_names[i], 24),
+                    lpad(@sprintf("%.6g", beta[i]), 14))
+                if beta_se !== nothing
+                    println(io, lpad(@sprintf("%.6g", beta_se[i]), 14))
+                else
+                    println(io, lpad("not computed", 14))
+                end
+            end
+            n_show < length(fixef_names) &&
+                println(io, "  … ", length(fixef_names) - n_show, " more fixed effects")
+            beta_se === nothing &&
+                println(io, "  Fixed-effect SEs have not been computed.")
+        end
+    end
+    return nothing
+end
+
+function Base.show(io::IO, ::MIME"text/plain", model::SGEModel)
+    fit = model.fit
+    if fit === nothing
+        return _show_aireml_report(io, length(model.y), size(model.Ainv, 1),
+            model.fixef_names, Float64[], nothing, String[], Float64[], Float64[],
+            false, 0, NaN, NaN; env_names=model.env_names,
+            env_levels=model.env_n_levels, peer_env=model.peer_env, ψ=model.ψ,
+            fitted=false)
+    end
+    beta_se = fit.beta_vcov === nothing ? nothing : sqrt.(diag(fit.beta_vcov))
+    return _show_aireml_report(io, length(model.y), size(model.Ainv, 1),
+        model.fixef_names, view(model.sol_y, model.layout.fixed), beta_se,
+        get_param_names(model), get_params(model), fit.se,
+        fit.converged, fit.n_iter, fit.step_crit, fit.alpha;
+        env_names=model.env_names, env_levels=model.env_n_levels,
+        peer_env=model.peer_env, ψ=model.ψ)
+end
+
+function Base.show(io::IO, ::MIME"text/plain", result::AiRemlResult)
+    env_levels = [length(ids) == 0 ? 0 : maximum(ids) for ids in result.env_ids]
+    return _show_aireml_report(io, result.n_obs, result.N_pedigree,
+        result.fixef_names, result.beta, result.beta_se,
+        result.param_names, vcat([result.σ2_d, result.σ2_s, result.σ_ds, result.σ2_e],
+            result.σ2_env, result.peer_env ? [result.σ2_pe] : Float64[]),
+        result.se, result.converged, result.n_iter, result.step_crit, result.alpha;
+        env_names=result.env_names, env_levels=env_levels,
+        peer_env=result.peer_env, ψ=result.ψ)
+end
+
+function Base.show(io::IO, model::SGEModel)
+    print(io, "SGEModel(", model.fit === nothing ? "not fitted" : "fitted",
+        ", n=", length(model.y), ", N=", size(model.Ainv, 1), ")")
+end
+
+function Base.show(io::IO, result::AiRemlResult)
+    print(io, "AiRemlResult(", result.converged ? "converged" : "not converged",
+        ", n_iter=", result.n_iter, ", n=", result.n_obs,
+        ", N=", result.N_pedigree, ")")
+end
+
+function fitted_state(model::SGEModel)
+    fit = model.fit
+    fit === nothing && throw(ArgumentError("Model has not been fitted; call fit_aireml! first"))
+    return fit
+end
+
+"""Return a view of the fitted fixed effects (changes to the view change the model)."""
+fixef(model::SGEModel) = (fitted_state(model); @view model.sol_y[model.layout.fixed])
+
+"""Return views of the fitted direct, social, shared and peer environmental effects."""
+function ranef(model::SGEModel)
+    fitted_state(model)
+    lay = model.layout
+    return (a_d=view(model.sol_y, lay.direct), a_s=view(model.sol_y, lay.social),
+        c_env=[view(model.sol_y, r) for r in lay.env], p_env=view(model.sol_y, lay.pe))
+end
+
+"""
+    fixed_effect_vcov!(model)
+
+Compute and cache `(X'V^-1 X)^-1` using one matrix-free MME solve per fixed
+effect. Return the same model, including when the covariance is already cached.
+Read the covariance from `model.fit.beta_vcov`. This optional post-fit operation
+does not change the estimates.
+"""
+function fixed_effect_vcov!(model::SGEModel)
+    fit = fitted_state(model)
+    cached = fit.beta_vcov
+    cached !== nothing && return model
+    settings = fit.settings
+    ws = model_workspace(model)
+    precond = settings.use_block_precond ? get_preconditioner(model, ws) : get_diag_preconditioner(model)
+    op = make_mme_operator(model, ws)
+    dest = zeros(get_dim(model))
+    covariance = zeros(model.layout.nf, model.layout.nf)
+    for j in axes(covariance, 2)
+        fill!(ws.rhs_buffer, 0.0)
+        ws.rhs_buffer[j] = 1.0
+        fill!(dest, 0.0)
+        _, history = cg!(dest, op, ws.rhs_buffer; Pl=precond,
+            reltol=settings.cg_reltol, maxiter=settings.cg_maxiter, log=true)
+        history.isconverged || error(
+            "Fixed-effect covariance CG did not converge for column $j after $(history.iters) iterations")
+        # The operator is residual-scaled: C_scaled = sigma2_e * C.
+        covariance[:, j] .= model.σ2_e .* view(dest, model.layout.fixed)
+    end
+    fit.beta_vcov = Matrix(Symmetric((covariance + covariance') / 2))
+    return model
+end
+
+"""
+    snapshot(model; include_fixef_se=true)
+
+Make an independent inference result, without data, pedigree matrices or fitting
+workspaces. Fixed-effect covariance/SEs require extra solves on the first call;
+set `include_fixef_se=false` to omit them explicitly. BLUP prediction-error
+variances are not computed.
+"""
+function snapshot(model::SGEModel; include_fixef_se::Bool=true)
+    fit = fitted_state(model)
+    if include_fixef_se
+        fixed_effect_vcov!(model)
+    end
+    beta_vcov = include_fixef_se ? copy(fit.beta_vcov) : nothing
+    effects = ranef(model)
+    return AiRemlResult(
+        model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e, copy(model.σ2_env),
+        copy(fixef(model)), copy(effects.a_d), copy(effects.a_s), [copy(c) for c in effects.c_env],
+        copy(fit.AI), copy(fit.se), fit.converged, fit.n_iter,
+        length(model.y), size(model.Ainv, 1), fit.settings.k,
+        copy(model.groups.obs_to_id), model.ψ, model.peer_env,
+        model.peer_env ? model.σ2_pe : 0.0, copy(effects.p_env), copy(model.pe_ids),
+        copy(model.fixef_names), copy(model.env_names), get_param_names(model),
+        copy.(model.env_ids), beta_vcov,
+        beta_vcov === nothing ? nothing : sqrt.(diag(beta_vcov)),
+        copy(fit.vcov), copy(fit.score), copy(fit.initial_params), copy(fit.ai_params),
+        fit.step_crit, fit.alpha, fit.settings)
 end
 
 function save_results(result::AiRemlResult, filename::String)
@@ -172,6 +363,15 @@ end
 function load_results(filename::String)
     return load(filename, "result")
 end
+
+"""Save the complete fitted model, including data and pedigree inputs."""
+function save_model(model::SGEModel, filename::String)
+    fitted_state(model)
+    jldsave(filename; model)
+    return filename
+end
+
+load_model(filename::String) = load(filename, "model")
 
 function update_params!(model::SGEModel, delta, damping)
     # Foreslåtte endringer
@@ -193,6 +393,7 @@ function update_params!(model::SGEModel, delta, damping)
     if model.peer_env
         model.σ2_pe = max(1e-6, model.σ2_pe + damping * delta[pe_param_index(model)])
     end
+    return model
 end
 
 function adapt_damping(α::Float64, step_crit::Float64, previous_step_crit::Float64;
@@ -216,16 +417,38 @@ function make_trace_probes(n::Int, k::Int; seed::Int=42)
     return [randn(n) for _ in 1:k]
 end
 
-function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
+"""
+    fit_aireml!(model; refit=false, kwargs...)
+
+Fit in place and return `model`. Variances and `sol_y` are authoritative;
+`model.fit` holds inference and convergence metadata, not duplicate BLUPs.
+Use `refit=true` to continue from a previously fitted model. Fitting scratch
+is local to this call. An interrupted/failed refit clears the old fit state.
+"""
+function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
     cg_maxiter=2000, cg_reltol=1e-7,
     cg_reltol_early=1e-5, cg_early_iters=3,
     ai_maxiter=500, ai_reltol=1e-5,
     use_block_precond=true, verbose_cg=true,
     adaptive_damping::Bool=true,
     log_file::String="",
-    seed::Int=42)
+    seed::Int=42, refit::Bool=false)
     isfinite(damping) && damping > 0 ||
         throw(ArgumentError("damping must be finite and positive"))
+    max_iter > 0 || throw(ArgumentError("max_iter must be positive"))
+    k > 0 || throw(ArgumentError("k must be positive"))
+    cg_maxiter > 0 && ai_maxiter > 0 ||
+        throw(ArgumentError("CG iteration limits must be positive"))
+    all(t -> isfinite(t) && t > 0, (cg_reltol, cg_reltol_early, ai_reltol)) ||
+        throw(ArgumentError("CG tolerances must be finite and positive"))
+    cg_early_iters >= 0 || throw(ArgumentError("cg_early_iters must be nonnegative"))
+    model.fit === nothing || refit ||
+        throw(ArgumentError("Model is already fitted; pass refit=true to fit again"))
+    settings = AiRemlSettings(; max_iter, k, damping, cg_maxiter, cg_reltol,
+        cg_reltol_early, cg_early_iters, ai_maxiter, ai_reltol,
+        use_block_precond, verbose_cg, adaptive_damping, log_file, seed)
+    initial_params = get_params(model)
+    model.fit = nothing
     n = length(model.y)
     N = size(model.Ainv, 1)
     dim = length(model.sol_y)
@@ -236,8 +459,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     nt = Threads.nthreads()
     max_tid = Threads.maxthreadid()   # Julia 1.12: threadid() kan returnere > nthreads()
 
-    # Allokere sol_z til riktig størrelse for denne kjøringen
-    model.sol_z = [zeros(dim) for _ in 1:k]
+    sol_z = [zeros(dim) for _ in 1:k]
 
     # Vi må bruke de SAMME z-vektorene i hver iterasjon
     # for at Hutchinson-estimatet skal være sammenlignbart (se make_trace_probes)
@@ -281,6 +503,9 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     previous_step_crit = Inf
     alpha_next = min(Float64(damping), 1.0)
     last_iter = 0
+    last_alpha = NaN
+    score = zeros(n_p)
+    ai_params = copy(initial_params)
     iter_times = Float64[]   # for ETA-beregning
     t_start_total = time()
 
@@ -308,7 +533,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
             flush(stdout)
         end
         t_z = @elapsed begin
-            _threaded_z_solves!(model, z_fixed_list, Pz_list, workspaces, preconditioners,
+            _threaded_z_solves!(sol_z, model, z_fixed_list, Pz_list, workspaces, preconditioners,
                 k, iter_cg_reltol, cg_maxiter)
         end
         if verbose_cg
@@ -340,6 +565,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
 
         # 5. Lagre gamle verdier for utskrift
         old_params = get_params(model)
+        copyto!(ai_params, old_params)
 
         # 6. Step-halving: finn steglengde som holder alle varianser > 0 og G positiv definitt.
         # Må ikke erstattes av ren komponentvis projeksjon i update_params!: et overskytende
@@ -361,6 +587,7 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
 
         # 7. Oppdater parametere med safe steglengde (update_params! gulv er siste skanse)
         update_params!(model, delta, α)
+        last_alpha = α
         new_params = get_params(model)
         actual_change = new_params .- old_params
 
@@ -459,30 +686,21 @@ function run_aireml(model::SGEModel; max_iter=15, k=5, damping=0.2,
     fill!(model.sol_y, 0.0)
     solve_mme_y!(model, workspaces[1], final_precond, reltol=cg_reltol, maxiter=cg_maxiter, verbose=verbose_cg)
 
-    # Pakk ut BLUE/BLUP fra løsningsvektoren
-    lay = model.layout
-    beta = model.sol_y[lay.fixed]
-    a_d = model.sol_y[lay.direct]
-    a_s = model.sol_y[lay.social]
+    vcov = inv(AI + 1e-6 * I)
+    model.fit = AiRemlFit(AI, vcov, sqrt.(abs.(diag(vcov))), score,
+        initial_params, ai_params, isfinite(step_crit) && step_crit < 1e-2,
+        last_iter, step_crit, last_alpha, settings, nothing)
+    return model
+end
 
-    # Env BLUPs
-    c_env = Vector{Float64}[]
-    for h in 1:H
-        push!(c_env, model.sol_y[lay.env[h]])
-    end
-    p_env = model.sol_y[lay.pe]
+"""
+    run_aireml(model; kwargs...)
 
-    # Beregn endelig AI og SE
-    AI_final = AI + 1e-6 * I
-    se_final = sqrt.(abs.(diag(inv(AI_final))))
-
-    result = AiRemlResult(
-        model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e, copy(model.σ2_env),
-        beta, a_d, a_s, c_env,
-        AI, se_final,
-        isfinite(step_crit) && step_crit < 1e-2, last_iter, n, N, k,
-        copy(model.groups.obs_to_id), model.ψ,
-        model.peer_env, model.peer_env ? model.σ2_pe : 0.0, p_env, copy(model.pe_ids)
-    )
-    return result
+Compatibility interface: fit in place and return a snapshot as before.
+Fixed-effect SEs are omitted to preserve the previous computational cost.
+New code should use `fit_aireml!` and explicitly request `snapshot` if needed.
+"""
+function run_aireml(model::SGEModel; refit::Bool=true, kwargs...)
+    fit_aireml!(model; refit, kwargs...)
+    return snapshot(model; include_fixef_se=false)
 end

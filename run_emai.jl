@@ -14,13 +14,29 @@ println("  julia --threads 8 --project=. run_emai.jl")
 # Columns in yX_obs.csv to use as covariates in X (intercept always added).
 const X_COLS = [:x]
 
+# Directory holding the input CSVs. Override with PEERIGE_DATA_DIR, e.g. on TSD:
+#   export PEERIGE_DATA_DIR=/ess/p805/data/durable/projects/<project>/data
+# Windows drive paths (N:\durable\...) do not exist on Linux compute nodes.
+const DATA_DIR = get(ENV, "PEERIGE_DATA_DIR", ".")
+
+function data_path(name::AbstractString)
+    path = joinpath(DATA_DIR, name)
+    if !Sys.iswindows() && occursin(r"^[A-Za-z]:[\\/]", path)
+        error("Input path '$path' is a Windows drive path, but Julia is running on Linux. " *
+              "Use the Linux mount instead (on TSD, N:\\durable -> /ess/<project>/data/durable).")
+    end
+    isfile(path) || error("Input file not found: '$path' (working directory: $(pwd()))")
+    return path
+end
+
 # =====================================================================
 # SHARED DATA LOADING
 # =====================================================================
+println("Input data directory: $(abspath(DATA_DIR))")
 # Observed-analysis table: one row per observed outcome.
-obs_table = DataFrame(CSV.File("yX_obs.csv"))
+obs_table = DataFrame(CSV.File(data_path("yX_obs.csv")))
 # Full roster table: social group membership for all relevant pedigree IDs.
-roster = DataFrame(CSV.File("roster.csv"))
+roster = DataFrame(CSV.File(data_path("roster.csv")))
 
 for col in (:y, :id_ped)
     @assert hasproperty(obs_table, col) "Missing column '$col' in yX_obs.csv"
@@ -38,7 +54,7 @@ obs_to_id = Int.(obs_table[:, :id_ped])
 y_obs = Float64.(obs_table[:, :y])
 X_obs = hcat(ones(length(y_obs)), [Float64.(obs_table[:, col]) for col in X_COLS]...)
 
-Ainv_df = DataFrame(CSV.File("Ainv_triplet.csv"))
+Ainv_df = DataFrame(CSV.File(data_path("Ainv_triplet.csv")))
 i_vals = Ainv_df[:, "i"]
 j_vals = Ainv_df[:, "j"]
 x_vals = Float64.(Ainv_df[:, "x"])
@@ -51,7 +67,7 @@ x_all = vcat(x_vals, x_vals[off_diag])
 Ainv = sparse(i_all, j_all, x_all)
 N_pedigree = size(Ainv, 1)
 
-L_Ainv_df = DataFrame(CSV.File("LAinv_triplet.csv"))
+L_Ainv_df = DataFrame(CSV.File(data_path("LAinv_triplet.csv")))
 L_Ainv = sparse(L_Ainv_df[:, "i"], L_Ainv_df[:, "j"], Float64.(L_Ainv_df[:, "x"]))
 L_Ainv = LowerTriangular(L_Ainv)
 

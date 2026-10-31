@@ -68,13 +68,23 @@ Note: z-solves, trace estimation, and AI work are always threaded via the
 - Threaded paths must use thread-local mutable buffers only
 - `A` must never be formed explicitly; apply it through sparse triangular solves
 - Numerical guards like `max(..., 1e-6)` and step-halving are deliberate stability controls. Do not replace step-halving in `run_aireml` by per-component flooring in `update_params!`: an overshooting AI step then sends several variances to their floors in one iteration, after which AI-REML only climbs back by roughly a factor `(1+α)` per iteration (scores in the millions, estimates near zero for many iterations).
-- AI-REML starts with the requested `damping` and adapts the next iteration's step based on progress of the undamped correction in AI-SE units, up to `α=1`. Feasibility step-halving remains active. Convergence uses `max|Δ|/SE < 1e-2`, not only the realized damped change; `adaptive_damping=false` disables the progress-based adjustment.
+- AI-REML starts with the requested `damping` (capped at 1) and adapts the next iteration's step based on progress of the undamped correction in AI-SE units, up to `α=1`. Feasibility step-halving remains active. Convergence uses `max|Δ|/SE < 1e-2`, not only the realized damped change; `adaptive_damping=false` retries the requested starting damping each iteration, even after an earlier step was halved.
 - **Each `Threads.@threads :static` block must live in its own dedicated helper function.** Multiple consecutive `@threads` blocks within a single function corrupt each other's closure environments in Julia 1.12 (non-deterministic results). The helpers are: `_threaded_vi_py!`, `_threaded_trace!`, `_threaded_ai_cg!`, `_threaded_ai_matvec!`, `_threaded_z_solves!`.
 
 ## High-Risk Areas
 
 ### Fitted state and performance
 
+- After every iteration `fit_aireml!` prints a timing header (time, ETA, CG
+  reltol) followed by the same report as `display(model)`, built from a temporary
+  `AiRemlFit`; `model.fit` is only set after the final BLUE/BLUP solve, so an
+  interrupted fit still leaves `model.fit === nothing`. All report/diagnostics
+  code is in `src/emai_show.jl`: estimates with SE, score, undamped AI step
+  `Δ_AI`, `|Δ|/SE` per component (◀ marks the one blocking convergence) and start
+  values; fixed effects; settings; G health; AI eigenvalues/condition number;
+  sampling correlations from AI⁻¹ (`!` marks |r| > 0.9). It works for both
+  `AiRemlFit` and `AiRemlResult`, which store the same fields.
+  `verbose_cg=false` hides the sub-step progress messages (CG, z-solves, score/AI).
 - Model mutators (`fit_aireml!`, `fixed_effect_vcov!`, `update_params!`,
   model-owned `solve_mme_y!`/`solve_mme_z!`) return the same model.
   Buffer mutators return the destination, not the model whose inputs they read.

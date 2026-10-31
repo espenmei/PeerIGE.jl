@@ -3,6 +3,26 @@ if !@isdefined(score_ai_dense_fixture)
 end
 using Test
 
+@testset "fixed damping retries the requested starting step" begin
+    f = score_ai_dense_fixture()
+    make() = SGEModel(f.y, f.X, f.Ainv, f.L_Ainv, f.groups, 1.2, 0.2, 0.12, 0.9)
+    settings = (k=20, seed=3, damping=1.0, adaptive_damping=false,
+        cg_reltol=1e-10, cg_reltol_early=1e-10, ai_reltol=1e-10,
+        cg_maxiter=2000, ai_maxiter=2000, verbose_cg=false)
+    reference = make()
+    fit_aireml!(reference; settings..., max_iter=1)
+    first_alpha = reference.fit.alpha
+    @test 0 < first_alpha < settings.damping
+
+    # A fresh one-step fit starts from the requested damping, not the last safe step.
+    fit_aireml!(reference; settings..., max_iter=1, refit=true)
+    @test reference.fit.alpha > first_alpha
+    model = make()
+    fit_aireml!(model; settings..., max_iter=2)
+    @test model.fit.alpha == reference.fit.alpha
+    @test get_params(model) ≈ get_params(reference) rtol=1e-7 atol=1e-10
+end
+
 @testset "fitted model and independent inference snapshots" begin
     f = score_ai_dense_fixture()
     make(H=0, peer=false, psi=0.0) = SGEModel(f.y, f.X, f.Ainv, f.L_Ainv,
@@ -64,6 +84,11 @@ using Test
                 params_before = get_params(model)
                 model_display = sprint(show, MIME"text/plain"(), model)
                 @test occursin("AI-REML fit", model_display)
+                @test occursin("Iteration diagnostics", model_display)
+                @test occursin("max|Δ_AI|/SE=", model_display)
+                @test occursin("Sampling correlations", model_display)
+                @test occursin("Settings: k=5", model_display)
+                @test occursin("Iteration diagnostics", sprint(show, MIME"text/plain"(), snapshot(model; include_fixef_se=false)))
                 @test occursin("Variance components", model_display)
                 @test occursin("σ²_d", model_display)
                 @test occursin("(Intercept)", model_display)

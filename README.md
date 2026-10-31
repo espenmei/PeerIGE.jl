@@ -4,8 +4,9 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## What This Repository Contains
 
-- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), and `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
+- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver), and `src/emai_show.jl` (model report with iteration diagnostics, printed after every AI-REML iteration and by `display(model)`). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
 - `run_emai.jl`: runnable entrypoint; fits both the base SGE model and the SGE+household model, prints a comparison table
+- `run_emai_hpc.jl`: single-input HPC runner for `obs_table_<INPUT>.csv` / `roster_<INPUT>.csv` files and trimmed pedigree triplets
 - `computational_approach.md`: math and algorithm overview
 - `sim/`: simulation scripts in R (`sim_peer.R`, `sim_peer_evn.R`; `sim_peer_evn.R` adds household/classroom/school shared environment effects); each writes the two-table format (`yX_obs.csv`, `roster.csv`)
 - `yX_obs.csv`: observed-only rows — one row per observed outcome, with columns `y`, `id_ped`, covariates, and optional environment IDs (e.g. `household`)
@@ -16,7 +17,7 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## Folder Structure
 
-- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_precond.jl`, `emai_mme.jl`, `emai_aireml.jl`)
+- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_precond.jl`, `emai_mme.jl`, `emai_aireml.jl`, `emai_show.jl`)
 - `sim`: R simulation scripts that generate the input CSVs
 - `outputs/logs`: AI-REML and benchmark log CSVs
 - `outputs/results`: JLD2 model result files
@@ -60,6 +61,24 @@ The runner currently:
 7. All runs are threaded — start with `--threads 8`
 
 Saving examples in the runner are commented out for the offline HPC environment.
+
+### Single-input HPC runner
+
+`run_emai_hpc.jl` fits one input dataset and saves the complete fitted model.
+Set the project directory as seen from the Linux compute node and pass the
+input-name suffix:
+
+```bash
+export PEERIGE_PROJECT_DIR=/path/to/project
+julia --threads "$SLURM_CPUS_PER_TASK" --project=. run_emai_hpc.jl edu10_MAT_termin1
+```
+
+It reads `obs_table_<INPUT>.csv`, `roster_<INPUT>.csv`,
+`Ainv_triplet_upper_trim.csv` (one triangle of `Ainv`) and
+`Linv_triplet_lower_trim.csv` (lower factor, `Ainv = L_Ainv * L_Ainv'`) from
+`$PEERIGE_PROJECT_DIR/data`, and writes the log and fitted model under
+`$PEERIGE_PROJECT_DIR/outputs`. Input checks are done by `load_observed_data`,
+`build_group_structure` and `fit_aireml!` (factor check).
 
 ## Fitted Models And Inference Snapshots
 
@@ -136,6 +155,17 @@ struct compatibility.
 
 - `outputs/logs/*.csv`: per-iteration timing, parameter estimates, scores, convergence diagnostics
 - `outputs/results/*.jld2`: optional complete `SGEModel` files or independent `AiRemlResult` snapshots
+
+## Post-Fit Inspection
+
+`post_fit.jl` is an interactive script. Set `project_dir` and `input` at the
+top, then run it cell by cell in VS Code (Shift+Enter) or the REPL
+(`julia --project=.`). It loads a snapshot or full model and shows the fit
+report, delta-method SEs for `r_ds`, `h²_d`, `σ²_TBV`/`T²` (at the median roster
+group size, accounting for dilution `ψ`), estimate correlations, BLUP summaries,
+and plots of convergence, direct vs social BLUPs and `σ²_TBV` by group size.
+It needs Plots.jl in the global environment; Plots is deliberately not a
+project dependency.
 
 ## Input File Contract
 

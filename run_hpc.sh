@@ -1,35 +1,29 @@
 #!/bin/bash
 
 #SBATCH --job-name=peerige
-#SBATCH --account=YourAccount          # replace with your project account
-#SBATCH --time=5-00:00:00              # 120 hours = 5 days
+#SBATCH --account=p805
+#SBATCH --time=2-00:00:00              # days-hrs:min:sec
 #SBATCH --ntasks=1                     # single process, multi-threaded
 #SBATCH --cpus-per-task=32             # threads for z-solves and AI CG solves
-#SBATCH --mem-per-cpu=8G               # 32 * 8G = 256 GB total
+#SBATCH --mem-per-cpu=3G
+
+# Submit from the PeerIGE.jl project root: sbatch run_hpc.sh
+# Data folder, run name and model are all set inside RUN_SCRIPT.
+RUN_SCRIPT="run_emai_hpc.jl"
 
 set -o errexit
 set -o nounset
 
 module --quiet purge
-module load Julia/1.12.2  # adjust to the version available on your cluster
+module load Julia/1.12.2
 module list
 
 # Prevent BLAS from spawning its own threads inside Julia's Threads.@threads blocks
 export OPENBLAS_NUM_THREADS=1
 
-echo "Job started: $(date)"
-echo "Running on node: $(hostname)"
-echo "Julia threads: $SLURM_CPUS_PER_TASK"
-echo "Working directory: $SLURM_SUBMIT_DIR"
-
 cd "$SLURM_SUBMIT_DIR"
+echo "Job started: $(date) on $(hostname), threads: $SLURM_CPUS_PER_TASK"
 
-if [ ! -f Project.toml ]; then
-	echo "Project.toml not found in $SLURM_SUBMIT_DIR"
-	echo "Submit this job from the PeerIGE.jl project root."
-	exit 1
-fi
-
-julia --threads "$SLURM_CPUS_PER_TASK" --project=. run_emai.jl
+julia --threads "$SLURM_CPUS_PER_TASK" --project=. "$RUN_SCRIPT"
 
 echo "Job finished: $(date)"

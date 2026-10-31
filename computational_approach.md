@@ -428,6 +428,24 @@ Results are stored in an `AiRemlResult` struct and serialized to disk via JLD2.
 
 Standard errors for the variance components are obtained from the inverse of the (regularized) AI matrix. Significance testing for individual parameters (e.g., $H_0: \sigma^2_s = 0$) can be performed via a Wald-type $z$-test: $z = \hat{\theta}_i / \text{SE}_i$.
 
+### 9.1 Model comparison: stochastic log-likelihood and ψ score test
+
+Fitting never evaluates $\ell_R$ (Section 3), but non-nested comparisons such as sum ($\psi=0$) versus mean ($\psi=1$) scaling need it. `src/emai_post.jl` evaluates two post-fit quantities at a model's current parameters; neither is used during fitting.
+
+**`stochastic_loglik`** uses the Henderson identity $\log|V| + \log|X'V^{-1}X| = n\log\sigma^2_e + \log|\Gamma| + \log|C|$, with $\Gamma = \mathrm{blockdiag}(G\otimes A, \sigma^2_h I, \sigma^2_{pe} I)$ and $C$ the unscaled MME coefficient matrix, so
+
+$$-2\ell_R = n\log\sigma^2_e + \log|\Gamma| + \log|C| + \mathbf{y}'P\mathbf{y}.$$
+
+All terms are exact ($\log|A| = -2\sum_i \log L_{ii}$ from the sparse factor) except $\log|C| = \log|M| + \operatorname{tr}\log(W^{-1}CW^{-\top})$, where $M = WW'$ is the block preconditioner with known $\log|M|$. The trace is estimated by stochastic Lanczos quadrature with Rademacher probes, using only matrix-free products with $C$; Lanczos needs about as many steps as the corresponding PCG solve. Constants are omitted, so only differences between fits with the same $\mathbf{y}$ and $X$ are meaningful. `loglik_difference` pairs the probes of two fits (same seed and dimension), which removes much of the Monte Carlo error.
+
+**`psi_score`** is the score for the dilution exponent. With $c_g = (m_g-1)^{-\psi}$, $\partial Z_s/\partial\psi = \Lambda Z_s$ where $\Lambda = \mathrm{diag}(-\log(m_{g(i)}-1))$. Writing $Q = Z_s(\sigma_{ds}AZ_d' + \sigma^2_s AZ_s' + \sigma^2_{pe}Z_s')$, $\dot V = \Lambda Q + Q'\Lambda$ and
+
+$$s_\psi = (P\mathbf{y})'\Lambda\hat{\mathbf{s}} - \operatorname{E}\big[(P\mathbf{z})'\Lambda(Q\mathbf{z})\big],$$
+
+where $\hat{\mathbf{s}} = Z_s\hat{\mathbf{a}}_s + Z_{pe}\hat{\mathbf{p}}$ is the fitted social part. The AI matrix augmented with $\psi$ gives the efficient information $\mathcal{I}_{\psi\psi} - \mathcal{I}_{\psi\theta}\mathcal{I}_{\theta\theta}^{-1}\mathcal{I}_{\theta\psi}$ and the score-test statistic $z = s_\psi/\sqrt{\cdot}$ for $H_0\colon \psi = \psi_0$ at a converged fit. The quadratic and trace terms nearly cancel, so the Monte Carlo SE of the score (`score_se`) must be checked against $|s_\psi|$.
+
+Both are verified against dense REML in `tests/test_post_fit.jl`: exact basis probes reproduce the dense log-likelihood and the finite-difference $\psi$ derivative, and Rademacher estimates fall within their Monte Carlo SE.
+
 ## 10. Software
 
 - **Julia 1.12** with `IterativeSolvers.jl` (PCG solver), `SparseArrays`, `JLD2`

@@ -4,7 +4,7 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## What This Repository Contains
 
-- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver), and `src/emai_show.jl` (model report with iteration diagnostics, printed after every AI-REML iteration and by `display(model)`). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
+- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver), `src/emai_show.jl` (model report with iteration diagnostics, printed after every AI-REML iteration and by `display(model)`), and `src/emai_post.jl` (post-fit `stochastic_loglik`, `loglik_difference` and `psi_score` for model comparison). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
 - `run_emai.jl`: runnable entrypoint; fits both the base SGE model and the SGE+household model, prints a comparison table
 - `run_emai_hpc.jl`: single-input HPC runner for `obs_table_<INPUT>.csv` / `roster_<INPUT>.csv` files and trimmed pedigree triplets
 - `computational_approach.md`: math and algorithm overview
@@ -17,7 +17,7 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## Folder Structure
 
-- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_precond.jl`, `emai_mme.jl`, `emai_aireml.jl`, `emai_show.jl`)
+- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_precond.jl`, `emai_mme.jl`, `emai_aireml.jl`, `emai_show.jl`, `emai_post.jl`)
 - `sim`: R simulation scripts that generate the input CSVs
 - `outputs/logs`: AI-REML and benchmark log CSVs
 - `outputs/results`: JLD2 model result files
@@ -158,14 +158,18 @@ struct compatibility.
 
 ## Post-Fit Inspection
 
-`post_fit.jl` is an interactive script. Set `project_dir` and `input` at the
-top, then run it cell by cell in VS Code (Shift+Enter) or the REPL
-(`julia --project=.`). It loads a snapshot or full model and shows the fit
-report, delta-method SEs for `r_ds`, `h²_d`, `σ²_TBV`/`T²` (at the median roster
-group size, accounting for dilution `ψ`), estimate correlations, BLUP summaries,
-and plots of convergence, direct vs social BLUPs and `σ²_TBV` by group size.
-It needs Plots.jl in the global environment; Plots is deliberately not a
-project dependency.
+`post_fit.jl` is an interactive script. Set `data_dir` and `run_name` at the top
+(the `DATA_DIR` and `RUN_NAME` used in `run_emai_hpc.jl`), then run it cell by
+cell in VS Code (Shift+Enter) or the REPL (`julia --project=.`). It loads
+`fits/RUN_NAME.jld2` and shows the fit report, delta-method SEs for `r_ds`, `h²_d`,
+the social variance received `σ²_soc` and `σ²_TBV`/`T²` (at the median roster group
+size), estimate correlations, BLUP summaries, and plots of convergence, BLUPs and
+`σ²_TBV`/`σ²_soc` by group size. All derived quantities use the fit's dilution
+exponent `ψ`; if `ψ` is estimated (listed in `param_names`) its uncertainty enters
+the SEs. Fits with different `ψ` are compared on this common scale, and with a
+paired stochastic REML log-likelihood difference and a `ψ` score test (see
+`computational_approach.md`, Section 9.1). It needs Plots.jl in the global
+environment; Plots is deliberately not a project dependency.
 
 ## Input File Contract
 

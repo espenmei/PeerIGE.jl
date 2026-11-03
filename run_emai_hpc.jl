@@ -47,6 +47,12 @@ println("Observed: $(length(obs.y)), roster: $(nrow(roster)), pedigree: $N, ",
 # in the same order (printed as σ²_env1, σ²_env2, ...).
 # For a pure direct + social genetic model, drop env_ids, σ2_env, env_names,
 # peer_env and σ2_pe.
+# For a direct-only model (direct + household + residual, no social effects):
+#   model = SGEModel(obs.y, obs.X, Ainv, L_Ainv, gs, 0.70, 0.0, 0.0, 0.20;
+#       social=false, fixef_names=obs.fixef_names,
+#       env_ids=observed_env_ids(obs_table, [:household]), σ2_env=[0.02],
+#       env_names=["household"])
+# and remove estimate_ψ/ψ_bounds/ψ_max_step from fit_aireml! below.
 env_cols = [:group, :household, :cohort]
 model = SGEModel(obs.y, obs.X, Ainv, L_Ainv, gs, 0.70, 0.02, 0.01, 0.20;
     fixef_names=obs.fixef_names,

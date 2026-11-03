@@ -1,6 +1,7 @@
 include("smoke_emai.jl")
 include("test_operator_identity.jl")
 include("test_score_ai.jl")
+include("test_direct_only.jl")
 include("test_estimate_psi.jl")
 include("test_post_fit.jl")
 include("test_post_fit_comparison.jl")

@@ -75,6 +75,7 @@ end
 #   [faste (nf) | direkte (N) | sosiale (N) | env1 (n_h1) | env2 ... | peer env (n_pe)]
 # Bygges én gang ved modellkonstruksjon; UnitRange-feltene er immutable og allokerer ikke i hot loops.
 # `pe` er en tom range når modellen ikke har sosial peer-miljøeffekt.
+# `social` er en tom range i en direkte-only modell (social=false): dim = nf + N + env + pe.
 struct SolutionLayout
     nf::Int
     N::Int
@@ -86,19 +87,21 @@ struct SolutionLayout
     dim::Int
 end
 
-function SolutionLayout(nf::Int, N::Int, env_n_levels::AbstractVector{Int}, n_pe::Int=0)
+function SolutionLayout(nf::Int, N::Int, env_n_levels::AbstractVector{Int}, n_pe::Int=0;
+    social::Bool=true)
     fixed = 1:nf
     direct = (nf+1):(nf+N)
-    social = (nf+N+1):(nf+2N)
+    n_social = social ? N : 0
+    social_rng = (nf+N+1):(nf+N+n_social)
     env = Vector{UnitRange{Int}}(undef, length(env_n_levels))
-    off = nf + 2N
+    off = nf + N + n_social
     for (h, n_h) in enumerate(env_n_levels)
         env[h] = (off+1):(off+n_h)
         off += n_h
     end
     pe = (off+1):(off+n_pe)
     off += n_pe
-    return SolutionLayout(nf, N, fixed, direct, social, env, pe, off)
+    return SolutionLayout(nf, N, fixed, direct, social_rng, env, pe, off)
 end
 
 # Varianskomponent-identifikator brukt i score/AI og Vi*u.
@@ -178,15 +181,33 @@ mutable struct SGEModel
     fit::Union{Nothing,AiRemlFit}
 end
 
-# Indeks for σ²_pe i parameter-/score-/AI-vektoren: [d, s, ds, e, env_1..env_H, pe]
-pe_param_index(model::SGEModel) = 5 + length(model.env_ids)
+"""
+    has_social(model)
 
-_base_param_count(model::SGEModel) = 4 + length(model.env_ids) + (model.peer_env ? 1 : 0)
+`false` for a direct-only model (`SGEModel(...; social=false)`), which has no
+social genetic block, σ²_s, σ_ds, peer environment or ψ.
+"""
+has_social(model::SGEModel) = !isempty(model.layout.social)
+
+# Parameter-/score-/AI-vektoren:
+#   social:      [d, s, ds, e, env_1..env_H, pe?, ψ?]
+#   direkte-only: [d, e, env_1..env_H]
+e_param_index(model::SGEModel) = has_social(model) ? 4 : 2
+pe_param_index(model::SGEModel) = e_param_index(model) + length(model.env_ids) + 1
+
+_base_param_count(model::SGEModel) =
+    e_param_index(model) + length(model.env_ids) + (model.peer_env ? 1 : 0)
 _fit_estimates_psi(model::SGEModel, fit=model.fit) =
     fit !== nothing && length(fit.score) == _base_param_count(model) + 1
 
+# Genetic covariance matrix: 2×2 [σ²_d σ_ds; σ_ds σ²_s], or 1×1 [σ²_d] when direct-only.
+genetic_covariance(model::SGEModel) = has_social(model) ?
+    [model.σ2_d model.σ_ds; model.σ_ds model.σ2_s] : fill(model.σ2_d, 1, 1)
+
 function get_params(model::SGEModel; include_ψ::Bool=_fit_estimates_psi(model))
-    p = vcat([model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e], model.σ2_env)
+    base = has_social(model) ? [model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e] :
+        [model.σ2_d, model.σ2_e]
+    p = vcat(base, model.σ2_env)
     model.peer_env && push!(p, model.σ2_pe)
     include_ψ && push!(p, model.ψ)
     return p
@@ -197,7 +218,7 @@ get_dim(model::SGEModel) = model.layout.dim
 
 function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
     env_ids::Vector{Vector{Int}}=Vector{Int}[], σ2_env::Vector{Float64}=Float64[],
-    ψ::Float64=0.0, peer_env::Bool=false, σ2_pe::Float64=0.0,
+    ψ::Float64=0.0, peer_env::Bool=false, σ2_pe::Float64=0.0, social::Bool=true,
     fixef_names::AbstractVector{<:AbstractString}=["x$j" for j in axes(X, 2)],
     env_names::AbstractVector{<:AbstractString}=["env$h" for h in eachindex(env_ids)])
     N = size(Ainv, 1)
@@ -209,6 +230,12 @@ function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
     length(env_names) == H ||
         throw(DimensionMismatch("env_names must contain one name per environment factor"))
     @assert length(σ2_env) == H "env_ids and σ2_env must have same length"
+    if !social
+        # Direct-only model: σ2_s and σ_ds are ignored and stored as 0; groups only map obs → ID.
+        peer_env && throw(ArgumentError("peer_env requires the social model (social=true)"))
+        ψ == 0.0 || throw(ArgumentError("ψ has no meaning in a direct-only model (social=false)"))
+        σ2_s, σ_ds = 0.0, 0.0
+    end
     @assert !peer_env || σ2_pe > 0 "peer_env=true requires a positive starting value σ2_pe"
 
     # Valider og precompute env
@@ -237,7 +264,7 @@ function SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e;
         warn_peer_env_identification(groups, group_scale)
     end
 
-    layout = SolutionLayout(nf, N, env_n_levels, length(pe_ids))
+    layout = SolutionLayout(nf, N, env_n_levels, length(pe_ids); social)
     sol_y = zeros(layout.dim)
     return SGEModel(y, X, Ainv, L_Ainv, groups, σ2_d, σ2_s, σ_ds, σ2_e,
         env_ids, env_n_levels, env_counts, σ2_env,

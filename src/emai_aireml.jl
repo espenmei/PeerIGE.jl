@@ -5,12 +5,12 @@
 # =====================================================================
 # Returnerer varianstype-representasjon for gjeldende modell (d, s, ds, e, env_h)
 function get_variance_components(model::SGEModel)
-    comps = VarianceComponent[
+    comps = has_social(model) ? VarianceComponent[
         VarianceComponent(VC_D, 0),
         VarianceComponent(VC_S, 0),
         VarianceComponent(VC_DS, 0),
         VarianceComponent(VC_E, 0)
-    ]
+    ] : VarianceComponent[VarianceComponent(VC_D, 0), VarianceComponent(VC_E, 0)]
     for h in 1:length(model.env_ids)
         push!(comps, VarianceComponent(VC_ENV, h))
     end
@@ -21,7 +21,7 @@ function get_variance_components(model::SGEModel)
 end
 
 function get_param_names(model::SGEModel; include_ψ::Bool=_fit_estimates_psi(model))
-    names = ["σ²_d", "σ²_s", "σ_ds", "σ²_e"]
+    names = has_social(model) ? ["σ²_d", "σ²_s", "σ_ds", "σ²_e"] : ["σ²_d", "σ²_e"]
     for h in 1:length(model.env_ids)
         push!(names, "σ²_env$h")
     end
@@ -318,21 +318,24 @@ end
 load_model(filename::String) = load(filename, "model")
 
 function update_params!(model::SGEModel, delta, damping)
+    ie = e_param_index(model)
     # Foreslåtte endringer
     new_d2 = model.σ2_d + damping * delta[1]
-    new_s2 = model.σ2_s + damping * delta[2]
-    new_ds = model.σ_ds + damping * delta[3]
-    new_e2 = model.σ2_e + damping * delta[4]
+    new_e2 = model.σ2_e + damping * delta[ie]
     # Sikkerhetsmekanismer (Bending)
     model.σ2_d = max(1e-4, new_d2)
-    model.σ2_s = max(1e-6, new_s2)
     model.σ2_e = max(1e-2, new_e2)
-    # Hold korrelasjonen i sjakk: |rho| < 0.99
-    max_cov = 0.99 * sqrt(model.σ2_d * model.σ2_s)
-    model.σ_ds = clamp(new_ds, -max_cov, max_cov)
+    if has_social(model)
+        new_s2 = model.σ2_s + damping * delta[2]
+        new_ds = model.σ_ds + damping * delta[3]
+        model.σ2_s = max(1e-6, new_s2)
+        # Hold korrelasjonen i sjakk: |rho| < 0.99
+        max_cov = 0.99 * sqrt(model.σ2_d * model.σ2_s)
+        model.σ_ds = clamp(new_ds, -max_cov, max_cov)
+    end
     # Env variances
     for h in 1:length(model.σ2_env)
-        model.σ2_env[h] = max(1e-6, model.σ2_env[h] + damping * delta[4+h])
+        model.σ2_env[h] = max(1e-6, model.σ2_env[h] + damping * delta[ie+h])
     end
     if model.peer_env
         model.σ2_pe = max(1e-6, model.σ2_pe + damping * delta[pe_param_index(model)])
@@ -345,9 +348,10 @@ const BOUNDARY_TOL = 1e-5
 # Maximize score'Δ - Δ'AI_reg*Δ/2 with Δ_i >= 0 for variances near their floor.
 # Release active constraints using the reduced quadratic's gradient, not the full
 # unconstrained step: correlations can otherwise pin a component with a positive score.
+# Boundary candidates: σ²_s (social models), σ²_env_h and σ²_pe; never σ²_d, σ_ds or σ²_e.
 function _boundary_constrained_delta(AI_reg, score, params;
-    variance_count::Int=length(params))
-    candidates = [i for i in vcat(2, collect(5:variance_count))
+    variance_count::Int=length(params), social::Bool=true)
+    candidates = [i for i in (social ? vcat(2, collect(5:variance_count)) : collect(3:variance_count))
         if params[i] <= BOUNDARY_TOL]
     delta = AI_reg \ score
     all(i -> delta[i] >= 0, candidates) && return delta, Int[]
@@ -383,7 +387,7 @@ end
 
 function _boundary_constrained_delta(model::SGEModel, AI_reg, score)
     return _boundary_constrained_delta(AI_reg, score, get_params(model);
-        variance_count=4 + length(model.σ2_env) + Int(model.peer_env))
+        variance_count=_base_param_count(model), social=has_social(model))
 end
 
 function _psi_reference_size(model::SGEModel)
@@ -472,6 +476,8 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
     k > 0 || throw(ArgumentError("k must be positive"))
     estimate_ψ && k < 2 &&
         throw(ArgumentError("Estimating ψ requires k ≥ 2 to estimate its Monte Carlo SE"))
+    estimate_ψ && !has_social(model) &&
+        throw(ArgumentError("estimate_ψ requires the social model; this model has social=false"))
     cg_maxiter > 0 && ai_maxiter > 0 ||
         throw(ArgumentError("CG iteration limits must be positive"))
     all(t -> isfinite(t) && t > 0, (cg_reltol, cg_reltol_early, ai_reltol)) ||
@@ -535,8 +541,11 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
             pe_cols = model.peer_env ? ",s2pe" : ""
             pe_se_cols = model.peer_env ? ",se_pe" : ""
             psi_se_cols = estimate_ψ ? ",se_psi" : ""
-            param_cols = join(["s2d","s2s","sds","s2e", ["s2env$h" for h in 1:H]...], ",") * pe_cols * ",psi"
-            se_cols = join(["se_d","se_s","se_ds","se_e", ["se_env$h" for h in 1:H]...], ",") * pe_se_cols * psi_se_cols
+            base_cols, base_se = has_social(model) ?
+                (["s2d","s2s","sds","s2e"], ["se_d","se_s","se_ds","se_e"]) :
+                (["s2d","s2e"], ["se_d","se_e"])
+            param_cols = join([base_cols..., ["s2env$h" for h in 1:H]...], ",") * pe_cols * ",psi"
+            se_cols = join([base_se..., ["se_env$h" for h in 1:H]...], ",") * pe_se_cols * psi_se_cols
             println(io, "iter,time_y,time_z,time_ai,time_total,cum_time,eta_min,",
                 param_cols, ",", se_cols, ",",
                 "score_norm,step_crit,alpha,rho_ds,cond_G,converged",
@@ -643,16 +652,22 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
         # deretter bare ca. faktor (1+α) per iterasjon tilbake (scorer i millioner).
         α = adaptive_damping ? alpha_next : min(Float64(damping), 1.0)
         α_start = α
+        social = has_social(model)
+        ie = e_param_index(model)
         for _attempt in 1:20
             new_d = model.σ2_d + α * applied_delta[1]
-            new_s = model.σ2_s + α * applied_delta[2]
-            new_ds = model.σ_ds + α * applied_delta[3]
-            new_e = model.σ2_e + α * applied_delta[4]
-            env_ok = all(model.σ2_env[h] + α * applied_delta[4+h] > 1e-8 for h in 1:H)
+            new_e = model.σ2_e + α * applied_delta[ie]
+            g_ok = if social
+                new_s = model.σ2_s + α * applied_delta[2]
+                new_ds = model.σ_ds + α * applied_delta[3]
+                new_s > 1e-8 && new_d * new_s > new_ds^2
+            else
+                true
+            end
+            env_ok = all(model.σ2_env[h] + α * applied_delta[ie+h] > 1e-8 for h in 1:H)
             pe_ok = !model.peer_env || model.σ2_pe + α * applied_delta[pe_param_index(model)] > 1e-8
             ψ_ok = !estimate_ψ || ψ_bounds[1] <= model.ψ + α * applied_delta[ψ_idx] <= ψ_bounds[2]
-            if new_d > 1e-6 && new_s > 1e-8 && new_e > 1e-4 &&
-                new_d * new_s > new_ds^2 && env_ok && pe_ok && ψ_ok
+            if new_d > 1e-6 && new_e > 1e-4 && g_ok && env_ok && pe_ok && ψ_ok
                 break
             end
             α *= 0.5
@@ -675,8 +690,8 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
         remaining_iters = max_iter - iter
         eta_min = remaining_iters * avg_iter / 60.0
 
-        # G-matrise helse
-        rho_ds, cond_G, _ = _g_health(model.σ2_d, model.σ2_s, model.σ_ds)
+        # G-matrise helse (ikke definert for direkte-only: logges som NaN)
+        rho_ds, cond_G = social ? _g_health(model.σ2_d, model.σ2_s, model.σ_ds)[1:2] : (NaN, NaN)
         score_norm = norm(score)
 
         # Use the undamped AI correction in units of its estimated standard errors;

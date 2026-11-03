@@ -21,9 +21,11 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
         "not converged after $(fit.n_iter) iteration(s)"
     println(io, "  Status: ", status)
     println(io, "  Data:   ", n_obs, " observations; ", n_pedigree, " pedigree members")
+    social = "σ²_s" in param_names
     println(io, "  Design: ", length(fixef_names), " fixed effects; ",
         length(env_names), " shared environment factor(s)",
-        peer_env ? "; peer environment enabled" : "")
+        peer_env ? "; peer environment enabled" : "",
+        social ? "" : "; direct-only (no social genetic effect)")
     if !isempty(env_names)
         println(io, "  Environment levels: ",
             join(["$(env_names[i])=$(env_levels[i])" for i in eachindex(env_names)], ", "))
@@ -31,7 +33,7 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
     fit === nothing && return nothing
 
     s = fit.settings
-    println(io, "  ψ:      ", ψ, " (", "ψ" in param_names ? "estimated" : "fixed", ")")
+    social && println(io, "  ψ:      ", ψ, " (", "ψ" in param_names ? "estimated" : "fixed", ")")
     @printf(io, "  Settings: k=%d, damping=%.3g%s, precond=%s, CG reltol=%.0e (iter ≤ %d) then %.0e, cg_maxiter=%d, seed=%d\n",
         s.k, s.damping, s.adaptive_damping ? " (adaptive)" : "",
         s.use_block_precond ? "Block" : "Diag", s.cg_reltol_early, s.cg_early_iters,
@@ -40,7 +42,8 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
     # Δ_AI is the undamped AI step and |Δ|/SE the convergence criterion per parameter.
     se, score = fit.se, fit.score
     delta, boundary_active = _boundary_constrained_delta(fit.AI + 1e-6 * I,
-        score, fit.ai_params; variance_count=length(param_names) - Int("ψ" in param_names))
+        score, fit.ai_params; variance_count=length(param_names) - Int("ψ" in param_names),
+        social)
     z = abs.(delta) ./ max.(se, eps())
     println(io)
     println(io, "Variance components")
@@ -79,12 +82,16 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
         fit.alpha, norm(params .- fit.ai_params) / norm(fit.ai_params),
         norm(params .- fit.initial_params) / norm(fit.initial_params))
     @printf(io, "  |score|:    %.4e\n", norm(score))
-    rho_ds, cond_G, eig_G = _g_health(params[1], params[2], params[3])
-    @printf(io, "  G:          ρ_ds=%.4f; cond(G)=%.1f; eig=[%.4g, %.4g]",
-        rho_ds, cond_G, eig_G[1], eig_G[2])
-    abs(rho_ds) > 0.95 && print(io, "  ⚠ ρ nær grense!")
-    cond_G > 1e4 && print(io, "  ⚠ dårlig kondisjonert!")
-    println(io)
+    if social
+        rho_ds, cond_G, eig_G = _g_health(params[1], params[2], params[3])
+        @printf(io, "  G:          ρ_ds=%.4f; cond(G)=%.1f; eig=[%.4g, %.4g]",
+            rho_ds, cond_G, eig_G[1], eig_G[2])
+        abs(rho_ds) > 0.95 && print(io, "  ⚠ ρ nær grense!")
+        cond_G > 1e4 && print(io, "  ⚠ dårlig kondisjonert!")
+        println(io)
+    else
+        println(io, "  G:          direct-only model (no social genetic effect)")
+    end
     eig_AI = eigvals(Symmetric(fit.AI))
     @printf(io, "  AI:         eig=[%.4g, %.4g]; cond(AI)=%.3g", eig_AI[1], eig_AI[end],
         eig_AI[end] / max(eig_AI[1], 1e-300))
@@ -123,9 +130,11 @@ Base.show(io::IO, ::MIME"text/plain", model::SGEModel) = _show_model(io, model, 
 
 function Base.show(io::IO, ::MIME"text/plain", result::AiRemlResult)
     env_levels = [length(ids) == 0 ? 0 : maximum(ids) for ids in result.env_ids]
+    base = "σ²_s" in result.param_names ?
+        [result.σ2_d, result.σ2_s, result.σ_ds, result.σ2_e] : [result.σ2_d, result.σ2_e]
     return _show_aireml_report(io, result.n_obs, result.N_pedigree,
         result.fixef_names, result.beta, result.beta_se,
-        result.param_names, vcat([result.σ2_d, result.σ2_s, result.σ_ds, result.σ2_e],
+        result.param_names, vcat(base,
             result.σ2_env, result.peer_env ? [result.σ2_pe] : Float64[],
             "ψ" in result.param_names ? [result.ψ] : Float64[]), result;
         env_names=result.env_names, env_levels=env_levels,

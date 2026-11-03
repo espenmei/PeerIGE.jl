@@ -294,6 +294,22 @@ model = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.05, 0.0, 2.0;
 
 `σ²_pe` is the last parameter in the score/AI/SE vectors and appears as `s2pe`/`se_pe` in the iteration log. `AiRemlResult` adds `σ2_pe`, `p_env` (BLUPs) and `pe_ids` (pedigree ID per BLUP). Against a classroom effect it is identified only through class-size variation, and against `σ2_s` only through relatedness. See `computational_approach.md` §1.7.
 
+## Direct-Only Model
+
+`SGEModel(...; social=false)` fits $y = X\beta + Z_d a_d + \sum_h Z_h c_h + e$ without the social genetic block. Use it, for example, for a direct + household + residual baseline:
+
+```julia
+model = SGEModel(y, X, Ainv, L_Ainv, gs, 0.7, 0.0, 0.0, 0.2; social=false,
+    env_ids=[household_ids], σ2_env=[0.02], env_names=["household"])
+fit_aireml!(model; max_iter=50, k=32)
+```
+
+- The positional `σ2_s` and `σ_ds` values are ignored and stored as 0. `gs` only maps observations to pedigree IDs; singleton groups are enough.
+- The parameter, score, AI and SE vectors are `[σ²_d, σ²_e, σ²_env...]`. The log columns are `s2d,s2e,s2env…`, with `rho_ds`/`cond_G` logged as `NaN`.
+- `peer_env`, nonzero `ψ`, `estimate_ψ` and `psi_score` are rejected. `compare_fits` only compares social fits.
+- To compare against a social fit, use `stochastic_loglik` on each fitted model and `loglik_difference`. The SE is unpaired because the MME dimensions differ.
+- `has_social(model)` reports which model type is in use.
+
 ## Current Working Assumptions
 
 - Julia 1.12

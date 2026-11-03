@@ -63,14 +63,15 @@ function _whitening(model::SGEModel)
     if model.peer_env
         d[lay.pe] .= model.pe_data_diag .+ model.σ2_e / model.σ2_pe
     end
-    G = [model.σ2_d model.σ_ds; model.σ_ds model.σ2_s]
+    G = genetic_covariance(model)
+    q = size(G, 1)
     U = cholesky(Symmetric(inv(G))).L
     N = lay.N
     logdet_Ainv = 2 * sum(log, diag(parent(model.L_Ainv)))
     logdet_M = sum(log, @view d[lay.fixed]) +
                sum(h -> sum(log, @view d[lay.env[h]]), eachindex(model.env_ids); init=0.0) +
                (model.peer_env ? sum(log, @view d[lay.pe]) : 0.0) +
-               2N * log(model.σ2_e) - N * logdet(G) + 2 * logdet_Ainv
+               q * N * log(model.σ2_e) - N * logdet(G) + q * logdet_Ainv
     return _Whitening(sqrt.(d), Matrix(inv(U)), sqrt(model.σ2_e), logdet_M), logdet_Ainv
 end
 
@@ -85,6 +86,17 @@ function _whiten!(out, x, Wh::_Whitening, model::SGEModel, t1, t2; transpose::Bo
     end
     xd = @view x[lay.direct]
     xs = @view x[lay.social]
+    if isempty(lay.social)
+        # Direct-only: W_g = √σ²_e U₁₁ L with scalar U₁₁
+        copyto!(t1, xd)
+        if !transpose
+            ldiv!(L, t1)
+        else
+            ldiv!(L', t1)
+        end
+        @. out[lay.direct] = Ui[1, 1] * t1 / Wh.sqrt_σ2e
+        return out
+    end
     if !transpose
         # (U⁻¹ ⊗ L⁻¹) x / √σ²_e
         copyto!(t1, xd); ldiv!(L, t1)
@@ -195,8 +207,8 @@ function stochastic_loglik(model::SGEModel; K::Int=30, seed::Int=2026, probes=no
 
     # The operator is residual-scaled: C_op = σ²_e C, so log|C| = log|C_op| - dim log σ²_e.
     logdet_C = Wh.logdet_M + mean(trlogB) - dim * log(model.σ2_e)
-    G = [model.σ2_d model.σ_ds; model.σ_ds model.σ2_s]
-    logdet_Γ = N * logdet(G) - 2 * logdet_Ainv +
+    G = genetic_covariance(model)
+    logdet_Γ = N * logdet(G) - size(G, 1) * logdet_Ainv +
                sum(h -> model.env_n_levels[h] * log(model.σ2_env[h]), eachindex(model.env_ids); init=0.0) +
                (model.peer_env ? length(model.pe_ids) * log(model.σ2_pe) : 0.0)
     loglik = -0.5 * (n * log(model.σ2_e) + logdet_Γ + logdet_C + yPy)
@@ -299,6 +311,8 @@ Positive scores mean the likelihood increases towards larger ψ (more dilution).
 """
 function psi_score(model::SGEModel; K::Int=30, seed::Int=2026, probes=nothing,
     reltol=1e-8, maxiter=2000)
+    has_social(model) ||
+        throw(ArgumentError("psi_score requires the social model; this model has social=false"))
     n = length(model.y)
     dim = model.layout.dim
     workspaces, preconditioners = _post_setup(model)

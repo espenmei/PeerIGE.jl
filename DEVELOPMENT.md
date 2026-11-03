@@ -65,6 +65,7 @@ Note: z-solves, trace estimation, and AI work are always threaded via the
 - `σ2_d`, `σ2_s`, and `σ2_e` must stay positive
 - `σ2_env[h]` must stay positive for each env factor `h`
 - `σ2_pe` must stay positive when `peer_env=true`; with `peer_env=false` the model, layout, and results must be bit-identical to the model without the feature
+- Direct-only models (`social=false`) have an empty `layout.social` and parameters `[σ2_d, σ2_e, σ2_env...]`; every social-specific code path must be guarded by `has_social(model)`, and the `social=true` path must stay bit-identical
 - Threaded paths must use thread-local mutable buffers only
 - `A` must never be formed explicitly; apply it through sparse triangular solves
 - Numerical guards like `max(..., 1e-6)` and step-halving are deliberate stability controls. Do not replace step-halving in `run_aireml` by per-component flooring in `update_params!`: an overshooting AI step then sends several variances to their floors in one iteration, after which AI-REML only climbs back by roughly a factor `(1+α)` per iteration (scores in the millions, estimates near zero for many iterations).

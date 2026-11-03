@@ -101,6 +101,9 @@ function _post_load(path)
 end
 
 function _post_validate(res, reference, obs)
+    "σ²_s" in res.param_names || throw(ArgumentError(
+        "compare_fits compares social (dilution) fits; for a direct-only fit use " *
+        "stochastic_loglik/loglik_difference on the fitted models"))
     res.n_obs == nrow(obs) && res.obs_to_id == obs.id_ped ||
         throw(ArgumentError("Saved observations do not match yX_obs.csv, including row order"))
     res.N_pedigree == reference.N_pedigree ||

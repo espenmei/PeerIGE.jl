@@ -175,3 +175,109 @@ end
         end
     end
 end
+
+    @testset "estimated ψ score and AI against dense REML" begin
+                    f = score_ai_dense_fixture()
+                    case = (H=1, peer_env=true, psi=0.45, covariance=0.08)
+                    model = SGEModel(f.y, f.X, f.Ainv, f.L_Ainv, f.groups,
+                        1.2, 0.2, case.covariance, 0.9;
+                        env_ids=f.env_ids[1:case.H], σ2_env=[0.4],
+                        ψ=case.psi, peer_env=case.peer_env, σ2_pe=0.15)
+                    raw_params = get_params(model; include_ψ=false)
+                    raw_scales = copy(model.group_scale)
+                    n = length(f.y)
+                    ref_peers = _psi_reference_size(model) - 1
+
+                    function dense_covariance_psi(theta, psi, group_scale)
+                        Zs = copy(f.Zs)
+                        for i in 1:n
+                            g = f.groups.obs_to_group[i]
+                            Zs[i, :] .*= group_scale[g]
+                        end
+                        Zg = hcat(f.Zd, Zs)
+                        G = [theta[1] theta[3]; theta[3] theta[2]]
+                        V = Zg * kron(G, f.A) * Zg' + theta[4] * I
+                        V += theta[5] .* (f.Zh[1] * f.Zh[1]')
+                        V += theta[6] .* (Zs * Zs')
+                        return V
+                    end
+                    raw_V = dense_covariance_psi(raw_params, case.psi, raw_scales)
+                    _convert_psi_scale!(model; to_centered=true)
+                    params = get_params(model; include_ψ=false)
+                    centered_V = dense_covariance_psi(params, case.psi, model.group_scale)
+                    @test centered_V ≈ raw_V rtol=1e-12 atol=1e-12
+
+                    function dense_loglik_psi(theta, psi)
+                        scales = [((length(members) - 1.0) / ref_peers)^(-psi)
+                                  for members in f.groups.members_id]
+                        F = cholesky(Symmetric(dense_covariance_psi(theta, psi, scales)))
+                        ViX, Viy = F \ f.X, F \ f.y
+                        FX = cholesky(Symmetric(f.X' * ViX))
+                        Py = Viy - ViX * (FX \ (f.X' * Viy))
+                        return -0.5 * (logdet(F) + logdet(FX) + dot(f.y, Py))
+                    end
+
+                    V = centered_V
+                    Vinv = inv(V)
+                    P = Vinv - Vinv * f.X * ((f.X' * Vinv * f.X) \ (f.X' * Vinv))
+                    Py_ref = P * f.y
+                    h = 1e-5
+                    Vdot = (dense_covariance_psi(params, case.psi + h,
+                                [((length(members) - 1.0) / ref_peers)^(-(case.psi + h))
+                                 for members in f.groups.members_id]) -
+                            dense_covariance_psi(params, case.psi - h,
+                                [((length(members) - 1.0) / ref_peers)^(-(case.psi - h))
+                                 for members in f.groups.members_id])) ./ (2h)
+                    # Form the ordinary variance derivatives directly at the centered design.
+                    Zs = copy(f.Zs)
+                    for i in 1:n
+                        g = f.groups.obs_to_group[i]
+                        Zs[i, :] .*= ((length(f.groups.members_id[g]) - 1.0) / ref_peers)^(-case.psi)
+                    end
+                    derivatives = [
+                        f.Zd * f.A * f.Zd',
+                        Zs * f.A * Zs',
+                        f.Zd * f.A * Zs' + Zs * f.A * f.Zd',
+                        Matrix{Float64}(I, n, n),
+                        f.Zh[1] * f.Zh[1]',
+                        Zs * Zs',
+                        Vdot,
+                    ]
+                    score_ref = [0.5 * (dot(Py_ref, D * Py_ref) - tr(P * D)) for D in derivatives]
+                    Q = hcat([D * Py_ref for D in derivatives]...)
+                    AI_ref = 0.5 .* (Q' * P * Q)
+                    all_params = vcat(params, case.psi)
+                    gradient_fd, _ = score_ai_finite_differences(
+                        p -> dense_loglik_psi(p[1:end-1], p[end]), all_params)
+
+                    workspaces = create_thread_workspaces(model, Threads.maxthreadid())
+                    preconditioners = [get_preconditioner(model, ws) for ws in workspaces]
+                    solve_mme_y!(model, workspaces[1], preconditioners[1]; reltol=1e-12, maxiter=2000, verbose=false)
+                    Py = zeros(n)
+                    compute_Px_from_sol!(Py, model, model.y, model.sol_y, workspaces[1])
+                    probes = sqrt(n) .* Matrix{Float64}(I, n, n)
+                    z = [Vector{Float64}(probes[:, j]) for j in axes(probes, 2)]
+                    Pz = [zeros(n) for _ in eachindex(z)]
+                    sol_z = [zeros(get_dim(model)) for _ in eachindex(z)]
+                    _threaded_z_solves!(sol_z, model, z, Pz, workspaces, preconditioners,
+                        length(z), 1e-12, 2000)
+                    score, AI = compute_score_and_ai(model, Py, z, Pz, workspaces, preconditioners;
+                        ai_reltol=1e-12, ai_maxiter=2000, estimate_ψ=true, verbose=false)
+                    @test maximum(abs.(score - score_ref)) < 1e-6
+                    @test maximum(abs.(score - gradient_fd)) < 1e-5
+                    @test maximum(abs.(AI - AI_ref)) < 1e-6
+                    @test issymmetric(AI)
+                    @test eigmin(Symmetric(AI)) > 0
+
+                    fit_model = SGEModel(f.y, f.X, f.Ainv, f.L_Ainv, f.groups,
+                        1.2, 0.2, case.covariance, 0.9;
+                        env_ids=f.env_ids[1:case.H], σ2_env=[0.4],
+                        ψ=case.psi, peer_env=case.peer_env, σ2_pe=0.15)
+                    fit_aireml!(fit_model; max_iter=1, k=8, damping=0.1, verbose_cg=false,
+                        estimate_ψ=true, ψ_bounds=(0.0, 1.0))
+                    @test length(fit_model.fit.score) == 7
+                    @test last(get_param_names(fit_model)) == "ψ"
+                    fit_result = snapshot(fit_model; include_fixef_se=false)
+                    @test last(fit_result.param_names) == "ψ"
+                    @test occursin("ψ", sprint(show, MIME"text/plain"(), fit_result))
+    end

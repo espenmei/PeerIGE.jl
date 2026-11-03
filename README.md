@@ -62,23 +62,55 @@ The runner currently:
 
 Saving examples in the runner are commented out for the offline HPC environment.
 
+### Interactive R data preparation
+
+`setup_edu_data.R` is an editable, cell-based copy of the education setup.
+Configure its input paths and run the cells in order. It retains the screenshot
+version's class-size filter, earliest education-year rule, whole-class year
+exclusion, twin exclusion from outcomes, and fixed effects (no term-1 covariate).
+By default it writes a separate `data/edu10_MAT_checked` bundle.
+
+The exported observations include `household_imputed`, its complement
+`household_observed`, the target and actual household years, and
+`household_year_shifted`. A register-observed household from the 2015 fallback
+is **not** necessarily a household observed at the outcome date. Household IDs
+are still pooled across years as in the original; verify that register codes
+are longitudinally stable before interpreting that random effect.
+
+The script stops on conflicting grades in the earliest recorded year rather
+than choosing one by file order. It verifies source-person identities, parent
+edges, unchanged observation/design ordering, and the sparse factor identity
+after pedigree trimming and reversal. Pedigree reversal changes the pedigree
+row order and observation-to-pedigree IDs, **not** the observation row order.
+
+`diagnostics/diagnose_h2_household.R` checks repeated IDs, household sizes, and
+fixed-effect-adjusted sibling correlations. Between-household comparisons
+require an observed/imputed flag; household-stratified comparisons exclude
+explicitly shifted household years. These are descriptive correlations, not
+REML heritability estimates or independent-pair significance tests.
+
+Validate both R scripts on synthetic data with
+`Rscript tests/test_edu_data_setup.R`.
+
 ### Single-input HPC runner
 
 `run_emai_hpc.jl` fits one input dataset and saves the complete fitted model.
-Set the project directory as seen from the Linux compute node and pass the
-input-name suffix:
+Edit `DATA_DIR`, `RUN_NAME`, the model block, and fitting options in the script;
+it takes no command-line model selector. Run it from the Julia project:
 
 ```bash
-export PEERIGE_PROJECT_DIR=/path/to/project
-julia --threads "$SLURM_CPUS_PER_TASK" --project=. run_emai_hpc.jl edu10_MAT_termin1
+julia --threads "$SLURM_CPUS_PER_TASK" --project=. run_emai_hpc.jl
 ```
 
-It reads `obs_table_<INPUT>.csv`, `roster_<INPUT>.csv`,
-`Ainv_triplet_upper_trim.csv` (one triangle of `Ainv`) and
-`Linv_triplet_lower_trim.csv` (lower factor, `Ainv = L_Ainv * L_Ainv'`) from
-`$PEERIGE_PROJECT_DIR/data`, and writes the log and fitted model under
-`$PEERIGE_PROJECT_DIR/outputs`. Input checks are done by `load_observed_data`,
-`build_group_structure` and `fit_aireml!` (factor check).
+It reads `yX_obs.csv`, `X_obs.csv`, `roster.csv`, `Ainv_triplet.csv`
+(upper triangle of `Ainv`), and `LAinv_triplet.csv` (lower factor,
+`Ainv = L_Ainv * L_Ainv'`) from `DATA_DIR`. The CSV log, fitted model, and a
+copy of the run script are written under `DATA_DIR/fits`. Input checks are done
+by `load_observed_data`, `build_group_structure`, and `fit_aireml!`.
+
+When transferring an updated implementation, replace the Julia files under
+`src/` on the HPC system and start a new Julia process. This does not require
+overwriting an existing manually configured `run_emai_hpc.jl`.
 
 ## Fitted Models And Inference Snapshots
 
@@ -88,7 +120,13 @@ it (`load_observed_data` also returns `fixef_names`):
 ```julia
 model = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
     fixef_names=["(Intercept)", "x"])
-fit_aireml!(model; max_iter=25, k=20)  # returns the same model
+# Choose one fit call. ψ is fixed by default:
+fit_aireml!(model; max_iter=25, k=20)
+
+# Or estimate ψ jointly with the variance components. This requires variable
+# roster group sizes and centers scaling at their median:
+fit_aireml!(model; max_iter=50, k=64, estimate_ψ=true,
+    ψ_bounds=(0.0, 1.0), ψ_max_step=0.25)
 
 model.σ2_d                 # fitted variance component
 fixef(model)               # view of beta in the authoritative solution vector
@@ -104,6 +142,11 @@ result = snapshot(model)   # independent, no y/X/pedigree matrices or scratch
 save_results(result, "inference_snapshot.jld2")
 result = load_results("inference_snapshot.jld2")
 ```
+
+Every iteration header shows the current ψ and whether it is fixed or estimated.
+When `log_file` is set, the iteration CSV also includes a `psi` column in both
+cases; `se_psi` and `psi_score_mcse` are included only when ψ is estimated.
+The reported value is after that iteration's parameter update.
 
 `model.fit` stores AI, regularized variance-component covariance/SEs, score,
 initial parameters, convergence diagnostics, and fit settings. Variance
@@ -158,18 +201,76 @@ struct compatibility.
 
 ## Post-Fit Inspection
 
-`post_fit.jl` is an interactive script. Set `data_dir` and `run_name` at the top
-(the `DATA_DIR` and `RUN_NAME` used in `run_emai_hpc.jl`), then run it cell by
-cell in VS Code (Shift+Enter) or the REPL (`julia --project=.`). It loads
-`fits/RUN_NAME.jld2` and shows the fit report, delta-method SEs for `r_ds`, `h²_d`,
-the social variance received `σ²_soc` and `σ²_TBV`/`T²` (at the median roster group
-size), estimate correlations, BLUP summaries, and plots of convergence, BLUPs and
-`σ²_TBV`/`σ²_soc` by group size. All derived quantities use the fit's dilution
-exponent `ψ`; if `ψ` is estimated (listed in `param_names`) its uncertainty enters
-the SEs. Fits with different `ψ` are compared on this common scale, and with a
-paired stochastic REML log-likelihood difference and a `ψ` score test (see
-`computational_approach.md`, Section 9.1). It needs Plots.jl in the global
-environment; Plots is deliberately not a project dependency.
+Set the single `data_dir` and editable `runs` list at the top of
+`post_fit.jl`. The defaults compare:
+
+- Mean: `ds_meandilution_class_household`
+- Sum: `ds_sum_dilution_class_household`
+- Estimated ψ: `ds_optdilution_class_household`
+
+Use the **original** `roster.csv`, `yX_obs.csv` and `fits/RUN_NAME.jld2`
+files in that directory. All fits must use identical observations, fixed
+effects, pedigree, social roster and random-effect designs apart from dilution.
+Full saved models are loaded one at a time and reduced to snapshots; their
+data/design fingerprints are checked. Snapshots can also be compared, but
+cannot establish equality of the original y, X or pedigree, so emit a warning.
+
+Open `post_fit.jl` in VS Code and start a Julia REPL with `--project=.`. Edit
+`data_dir` and `runs`, then execute the **Setup** and **Load and check the fits**
+cells. Run the other `##` sections individually to inspect the tables and plots
+you want. They leave `report` and the generated `figures` available in the
+REPL; creating one plot does not generate the others. Re-running Load clears
+the plot collection, preventing figures from different comparisons being mixed.
+The calculations live in `src/emai_post_compare.jl`, which must accompany the
+script when copying it to another machine.
+
+Run the **Save tables and the figures created so far** cell when you want to
+write output. It saves seven CSV tables and only the figures you generated to
+`data_dir/fits/comparison`, overwriting files with matching names. Other figures
+from an earlier save remain unchanged. The tables cover fit status and ψ/SE, raw and common-reference components,
+derived quantities, fixed effects, group-size curves, and pairwise BLUP
+correlations/RMSE/top-10% overlap. Plots include all component trajectories
+(including classroom/household), ψ, step length, convergence criterion, estimate
+correlation matrices and BLUP scatterplots. BLUP statistics use **all observed
+individuals**; only scatterplots use a reproducible sample of at most 20,000.
+Top-tail overlap is the fraction of equally sized top-10% sets shared by two
+fits (ties follow the common observation order). No BLUP prediction-error SEs
+are claimed; fixed-effect SEs appear only when already cached in the saved fit.
+
+Raw social variances/covariances are **not directly comparable**: estimated ψ
+uses centered scaling, while fixed ψ uses raw `(m-1)^(-ψ)` scaling. Common-scale
+tables use per-peer variance `c(m₀)^2 σ²_s`, covariance `c(m₀) σ_ds` and,
+if fitted, `c(m₀)^2 σ²_pe`, at the rounded median non-singleton roster size m₀.
+BLUP plots use `a_d`, `c(m₀) a_s`, and `a_d + (m₀-1)c(m₀)a_s`.
+Derived quantities and delta-method SEs include ψ and its cross-covariances when
+estimated. The reference phenotype variance/social variance received assume
+unrelated group members and omit focal-peer genetic covariance: these are
+reference-model summaries, **not** the empirical variance of y. `T²` can exceed 1.
+Intervals are approximate 95% Wald intervals, unreliable at boundaries or under
+weak identification. AI/SEs belong to the pre-last-update point; inspect
+`max_last_update` and convergence before interpreting them. Non-converged fits
+are visibly flagged and are not ranked by these descriptive plots.
+
+Expensive likelihood and ψ-score calculations are **never run automatically**.
+With full, converged models, explicitly run in a suitably sized batch job:
+
+```julia
+likelihood = compare_likelihood(report; K=64)
+scores = compare_psi_scores(report; K=64)  # fixed-ψ fits only
+```
+
+These also load one full model at a time. Likelihood differences are relative to
+the first configured fit and use paired probes with a shared seed; output
+includes Monte Carlo SEs, maximum Lanczos steps, the configured limit/tolerance,
+and counts of probes reaching that limit. MCSE does **not** include
+Lanczos truncation error: repeat with tighter tolerances/more steps before
+ranking close fits, and increase K if Monte Carlo uncertainty is too large.
+Score diagnostics require the other parameters to be at an optimum; boundaries
+or weak identification invalidate a naive normal interpretation. See
+`computational_approach.md`, Section 9.1. Matrix-free post-fit work can require
+substantial **per-thread** memory; start with few threads. Plots.jl is required
+in the global environment, deliberately not as a project dependency. On a
+headless node, set `ENV["GKSwstype"]="100"` before `using Plots`.
 
 ## Input File Contract
 

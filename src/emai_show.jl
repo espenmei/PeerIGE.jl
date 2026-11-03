@@ -31,7 +31,7 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
     fit === nothing && return nothing
 
     s = fit.settings
-    println(io, "  ψ:      ", ψ)
+    println(io, "  ψ:      ", ψ, " (", "ψ" in param_names ? "estimated" : "fixed", ")")
     @printf(io, "  Settings: k=%d, damping=%.3g%s, precond=%s, CG reltol=%.0e (iter ≤ %d) then %.0e, cg_maxiter=%d, seed=%d\n",
         s.k, s.damping, s.adaptive_damping ? " (adaptive)" : "",
         s.use_block_precond ? "Block" : "Diag", s.cg_reltol_early, s.cg_early_iters,
@@ -39,7 +39,8 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
 
     # Δ_AI is the undamped AI step and |Δ|/SE the convergence criterion per parameter.
     se, score = fit.se, fit.score
-    delta = fit.vcov * score
+    delta, boundary_active = _boundary_constrained_delta(fit.AI + 1e-6 * I,
+        score, fit.ai_params; variance_count=length(param_names) - Int("ψ" in param_names))
     z = abs.(delta) ./ max.(se, eps())
     println(io)
     println(io, "Variance components")
@@ -49,6 +50,10 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
         @printf(io, "  %-10s %12.6g %12.6g %+12.4g %+12.4g %10.3g %12.6g%s\n",
             param_names[i], params[i], se[i], score[i], delta[i], z[i],
             fit.initial_params[i], z[i] == maximum(z) && !fit.converged ? "  ◀" : "")
+    end
+    if !isempty(boundary_active)
+        println(io, "  Held near lower bound: ", join(param_names[boundary_active], ", "),
+            "; Δ_AI uses the reduced AI system.")
     end
 
     if !isempty(fixef_names)
@@ -70,7 +75,7 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
     println(io, "Iteration diagnostics")
     @printf(io, "  Criterion:  max|Δ_AI|/SE=%.3e (%s); converged when < 0.01\n",
         fit.step_crit, param_names[argmax(z)])
-    @printf(io, "  Steps:      last α=%.3f; last relative change=%.3e; relative change from start=%.3e\n",
+    @printf(io, "  Steps:      last α=%.3e; last relative change=%.3e; relative change from start=%.3e\n",
         fit.alpha, norm(params .- fit.ai_params) / norm(fit.ai_params),
         norm(params .- fit.initial_params) / norm(fit.initial_params))
     @printf(io, "  |score|:    %.4e\n", norm(score))
@@ -106,9 +111,10 @@ end
 # Report for a model with a given fit object; fit_aireml! passes the current iteration's fit.
 function _show_model(io::IO, model::SGEModel, fit; in_progress=false)
     beta_se = fit === nothing || fit.beta_vcov === nothing ? nothing : sqrt.(diag(fit.beta_vcov))
+    estimate_ψ = _fit_estimates_psi(model, fit)
     return _show_aireml_report(io, length(model.y), size(model.Ainv, 1),
         model.fixef_names, view(model.sol_y, model.layout.fixed), beta_se,
-        get_param_names(model), get_params(model), fit;
+        get_param_names(model; include_ψ=estimate_ψ), get_params(model; include_ψ=estimate_ψ), fit;
         env_names=model.env_names, env_levels=model.env_n_levels,
         peer_env=model.peer_env, ψ=model.ψ, in_progress)
 end
@@ -120,7 +126,8 @@ function Base.show(io::IO, ::MIME"text/plain", result::AiRemlResult)
     return _show_aireml_report(io, result.n_obs, result.N_pedigree,
         result.fixef_names, result.beta, result.beta_se,
         result.param_names, vcat([result.σ2_d, result.σ2_s, result.σ_ds, result.σ2_e],
-            result.σ2_env, result.peer_env ? [result.σ2_pe] : Float64[]), result;
+            result.σ2_env, result.peer_env ? [result.σ2_pe] : Float64[],
+            "ψ" in result.param_names ? [result.ψ] : Float64[]), result;
         env_names=result.env_names, env_levels=env_levels,
         peer_env=result.peer_env, ψ=result.ψ)
 end

@@ -227,9 +227,11 @@ end
 #   tr(PV̇)  = 2 E[(Pz)'Λ(Qz)].
 # (Z_pe Z_pe' = Z_s Z_s', since Z_s has nonzero columns only for roster members.)
 
-function _psi_log_weights(model::SGEModel)
+function _psi_log_weights(model::SGEModel; centered::Bool=_fit_estimates_psi(model))
     gs = model.groups
-    lg = [length(m) <= 1 ? 0.0 : -log(length(m) - 1.0) for m in gs.members_id]
+    ref_peers = centered ? _psi_reference_size(model) - 1 : 1.0
+    lg = [length(m) <= 1 ? 0.0 :
+          -log((length(m) - 1.0) / ref_peers) for m in gs.members_id]
     return [lg[g] for g in gs.obs_to_group]
 end
 

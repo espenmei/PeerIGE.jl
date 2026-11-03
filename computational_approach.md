@@ -307,7 +307,13 @@ A step-halving safeguard ensures:
 
 The step size $\alpha$ starts at the requested `damping` value and is halved up to 20 times until both conditions are satisfied. The floors in `update_params!` are only a last-resort guard. Replacing step-halving by component-wise projection to those floors is unsafe: one overshooting AI step can put several variances on their floors at once, and from far below the optimum the AI step only grows a variance by roughly a factor $(1+\alpha)$ per iteration.
 
-By default, `run_aireml` adapts the next iteration's starting $\alpha$ using the reduction in the largest absolute AI correction measured in its estimated standard errors: it grows $\alpha$ by 1.5 (up to 1.0) when this criterion drops by at least 10%, halves it when the criterion worsens by more than 10%, and otherwise leaves it unchanged. Set `adaptive_damping=false` to retain a fixed starting damping value. The feasibility step-halving remains active either way. This progress-based rule does not guarantee monotone likelihood improvement; the objective is still not evaluated. Convergence is checked using the undamped AI correction in standard-error units (`max|Δ|/SE < 1e-2`), so a tiny damped step alone cannot mark a fit converged.
+Step-halving alone can, however, freeze the fit once a variance is already at its floor. If the AI step for that component points outward, feasibility forces $\alpha\approx$ floor$/|\Delta_i|$ for *all* parameters. Before step-halving, `run_aireml` therefore maximizes the local AI quadratic $s'\Delta-\Delta'(\mathrm{AI}+10^{-6}I)\Delta/2$, requiring $\Delta_i\ge0$ for any $\sigma^2_s$, $\sigma^2_{env,h}$ or $\sigma^2_{pe}$ at or below `BOUNDARY_TOL` (1e-5). This applies to classroom and household effects even without peer environment or estimated dilution.
+
+The small active-set solve holds outward boundary steps at zero and re-solves for the free parameters. It also releases a held component whenever the reduced gradient $s_i-[(\mathrm{AI}+10^{-6}I)\Delta]_i$ points inward. Merely fixing every negative unconstrained step can otherwise falsely declare convergence when correlated boundary components have positive scores. The active set is rebuilt every iteration. Positive $\sigma^2_s$ does not force $\sigma_{ds}=0$; the existing positive-definiteness step-halving still protects $G$. No interior variance is projected to a floor.
+
+Iteration reports identify held components and display the reduced AI step used by the optimizer. Step lengths are printed in scientific notation so a stalled step cannot masquerade as an ordinary rounded `0.000`. Reported SEs and covariance matrices still come from the full regularized AI inverse, not a boundary-adjusted sampling distribution.
+
+By default, `run_aireml` adapts the next iteration's starting $\alpha$ using the reduction in the largest absolute AI correction measured in its estimated standard errors: it grows $\alpha$ by 1.5 (up to 1.0) when this criterion drops by at least 10%, halves it when the criterion worsens by more than 10%, and otherwise leaves it unchanged. Set `adaptive_damping=false` to retain a fixed starting damping value. The adaptation starts from the attempted $\alpha$ before feasibility halving, so a boundary-limited step does not carry over as the next starting $\alpha$. The feasibility step-halving remains active either way. This progress-based rule does not guarantee monotone likelihood improvement; the objective is still not evaluated. Convergence is checked using the undamped AI correction in standard-error units (`max|Δ|/SE < 1e-2`), so a tiny damped step alone cannot mark a fit converged.
 
 ## 5. Solving the MME: Conjugate Gradient with Matrix-Free Operator
 
@@ -428,9 +434,9 @@ Results are stored in an `AiRemlResult` struct and serialized to disk via JLD2.
 
 Standard errors for the variance components are obtained from the inverse of the (regularized) AI matrix. Significance testing for individual parameters (e.g., $H_0: \sigma^2_s = 0$) can be performed via a Wald-type $z$-test: $z = \hat{\theta}_i / \text{SE}_i$.
 
-### 9.1 Model comparison: stochastic log-likelihood and ψ score test
+### 9.1 Estimating ψ and comparing fitted models
 
-Fitting never evaluates $\ell_R$ (Section 3), but non-nested comparisons such as sum ($\psi=0$) versus mean ($\psi=1$) scaling need it. `src/emai_post.jl` evaluates two post-fit quantities at a model's current parameters; neither is used during fitting.
+Fitting never evaluates $\ell_R$ (Section 3), but non-nested comparisons such as sum ($\psi=0$) versus mean ($\psi=1$) scaling need it. `src/emai_post.jl` provides `stochastic_loglik` and `loglik_difference` for post-fit comparisons. It also provides the post-fit `psi_score`; the score and AI derivative are reused by the optional in-fit estimate of $\psi$.
 
 **`stochastic_loglik`** uses the Henderson identity $\log|V| + \log|X'V^{-1}X| = n\log\sigma^2_e + \log|\Gamma| + \log|C|$, with $\Gamma = \mathrm{blockdiag}(G\otimes A, \sigma^2_h I, \sigma^2_{pe} I)$ and $C$ the unscaled MME coefficient matrix, so
 
@@ -438,13 +444,19 @@ $$-2\ell_R = n\log\sigma^2_e + \log|\Gamma| + \log|C| + \mathbf{y}'P\mathbf{y}.$
 
 All terms are exact ($\log|A| = -2\sum_i \log L_{ii}$ from the sparse factor) except $\log|C| = \log|M| + \operatorname{tr}\log(W^{-1}CW^{-\top})$, where $M = WW'$ is the block preconditioner with known $\log|M|$. The trace is estimated by stochastic Lanczos quadrature with Rademacher probes, using only matrix-free products with $C$; Lanczos needs about as many steps as the corresponding PCG solve. Constants are omitted, so only differences between fits with the same $\mathbf{y}$ and $X$ are meaningful. `loglik_difference` pairs the probes of two fits (same seed and dimension), which removes much of the Monte Carlo error.
 
-**`psi_score`** is the score for the dilution exponent. With $c_g = (m_g-1)^{-\psi}$, $\partial Z_s/\partial\psi = \Lambda Z_s$ where $\Lambda = \mathrm{diag}(-\log(m_{g(i)}-1))$. Writing $Q = Z_s(\sigma_{ds}AZ_d' + \sigma^2_s AZ_s' + \sigma^2_{pe}Z_s')$, $\dot V = \Lambda Q + Q'\Lambda$ and
+**`psi_score`** is the score for the dilution exponent. A fit with fixed $\psi$ uses $c_g = (m_g-1)^{-\psi}$. When estimating $\psi$, the scale is centered at the median roster group size $m_\mathrm{ref}$:
+
+$$c_g = \left(\frac{m_g-1}{m_\mathrm{ref}-1}\right)^{-\psi}.$$
+
+This reparameterization leaves the covariance model unchanged (the social variance and covariance parameters are rescaled at the starting $\psi$), but makes $\sigma^2_s$ and $\sigma^2_{pe}$ refer to a typical-sized group, reducing their correlation with $\psi$. In the centered parameterization, $\psi=0$ is sum scaling, while $\psi=1$ is mean scaling up to a constant absorbed by the variance components. The derivative is $\partial Z_s/\partial\psi = \Lambda Z_s$ with $\Lambda_{ii}=-\log((m_{g(i)}-1)/(m_\mathrm{ref}-1))$. Writing $Q = Z_s(\sigma_{ds}AZ_d' + \sigma^2_s AZ_s' + \sigma^2_{pe}Z_{pe}')$, $\dot V = \Lambda Q + Q'\Lambda$ and
 
 $$s_\psi = (P\mathbf{y})'\Lambda\hat{\mathbf{s}} - \operatorname{E}\big[(P\mathbf{z})'\Lambda(Q\mathbf{z})\big],$$
 
 where $\hat{\mathbf{s}} = Z_s\hat{\mathbf{a}}_s + Z_{pe}\hat{\mathbf{p}}$ is the fitted social part. The AI matrix augmented with $\psi$ gives the efficient information $\mathcal{I}_{\psi\psi} - \mathcal{I}_{\psi\theta}\mathcal{I}_{\theta\theta}^{-1}\mathcal{I}_{\theta\psi}$ and the score-test statistic $z = s_\psi/\sqrt{\cdot}$ for $H_0\colon \psi = \psi_0$ at a converged fit. The quadratic and trace terms nearly cancel, so the Monte Carlo SE of the score (`score_se`) must be checked against $|s_\psi|$.
 
-Both are verified against dense REML in `tests/test_post_fit.jl`: exact basis probes reproduce the dense log-likelihood and the finite-difference $\psi$ derivative, and Rademacher estimates fall within their Monte Carlo SE.
+Estimate $\psi$ explicitly with `fit_aireml!(model; estimate_ψ=true, k=64, ψ_bounds=(0,1), ψ_max_step=0.25)`. It is fixed by default. The score trace reuses the fit's Hutchinson probes; the augmented AI requires one extra MME solve per iteration. Bounds and step limits prevent large updates, but the Monte Carlo error in the score can still dominate when the score trace and quadratic term nearly cancel, so check the score SE and repeat with more probes when needed. Estimation requires variation in roster group size.
+
+The score, AI, stochastic likelihood and paired difference are verified against dense REML in `tests/test_score_ai.jl` and `tests/test_post_fit.jl`; simulated recovery of estimated $\psi$ is checked in `tests/test_estimate_psi.jl`.
 
 ## 10. Software
 

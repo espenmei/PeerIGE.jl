@@ -181,9 +181,14 @@ end
 # Indeks for σ²_pe i parameter-/score-/AI-vektoren: [d, s, ds, e, env_1..env_H, pe]
 pe_param_index(model::SGEModel) = 5 + length(model.env_ids)
 
-function get_params(model::SGEModel)
+_base_param_count(model::SGEModel) = 4 + length(model.env_ids) + (model.peer_env ? 1 : 0)
+_fit_estimates_psi(model::SGEModel, fit=model.fit) =
+    fit !== nothing && length(fit.score) == _base_param_count(model) + 1
+
+function get_params(model::SGEModel; include_ψ::Bool=_fit_estimates_psi(model))
     p = vcat([model.σ2_d, model.σ2_s, model.σ_ds, model.σ2_e], model.σ2_env)
     model.peer_env && push!(p, model.σ2_pe)
+    include_ψ && push!(p, model.ψ)
     return p
 end
 

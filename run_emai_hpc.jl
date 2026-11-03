@@ -59,8 +59,9 @@ model = SGEModel(obs.y, obs.X, Ainv, L_Ainv, gs, 0.70, 0.02, 0.01, 0.20;
 fit_dir = joinpath(DATA_DIR, "fits")
 mkpath(fit_dir)
 cp(@__FILE__, joinpath(fit_dir, "$RUN_NAME.jl"); force=true)
-@time fit_aireml!(model; max_iter=100, k=20, damping=0.2, cg_maxiter=5000,
+@time fit_aireml!(model; max_iter=100, k=64, damping=0.2, cg_maxiter=5000,
     cg_reltol_early=1e-5, cg_early_iters=4, cg_reltol=1e-7,
+    estimate_ψ=true, ψ_bounds=(0.0, 1.0), ψ_max_step=0.25,
     log_file=joinpath(fit_dir, "$RUN_NAME.csv"))
 
 display(model)

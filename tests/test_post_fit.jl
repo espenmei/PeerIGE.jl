@@ -146,4 +146,31 @@ const POST_FIT_CASES = (
         @printf("[post] Δloglik(ψ=1 - ψ=0) exact=%.4f paired=%.4f±%.4f (unpaired se %.4f)\n",
             exact, d.Δ, d.se, sqrt(a.se^2 + b.se^2))
     end
+
+    @testset "centered parameterization preserves the exact likelihood" begin
+        case = (H=1, peer_env=true, psi=0.5, covariance=0.08)
+        model = post_fit_model(f, case)
+        _convert_psi_scale!(model; to_centered=true)
+        θ = get_params(model; include_ψ=false)
+        n = length(f.y)
+        Zs = copy(f.Zs1)
+        for i in 1:n
+            g = f.groups.obs_to_group[i]
+            Zs[i, :] .*= model.group_scale[g]
+        end
+        Zg = hcat(f.Zd, Zs)
+        G = [θ[1] θ[3]; θ[3] θ[2]]
+        V = Zg * kron(G, f.A) * Zg' + θ[4] * I
+        V += θ[5] .* (f.Zh[1] * f.Zh[1]')
+        V += θ[6] .* (Zs * Zs')
+        F = cholesky(Symmetric(V))
+        ViX, Viy = F \ f.X, F \ f.y
+        FX = cholesky(Symmetric(f.X' * ViX))
+        Py = Viy - ViX * (FX \ (f.X' * Viy))
+        exact = -0.5 * (logdet(F) + logdet(FX) + dot(f.y, Py))
+        dim = get_dim(model)
+        r = stochastic_loglik(model; probes=sqrt(dim) .* Matrix{Float64}(I, dim, dim),
+            lanczos_maxiter=2dim)
+        @test abs(r.loglik - exact) < 1e-6
+    end
 end

@@ -6,7 +6,6 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 - `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver), `src/emai_show.jl` (model report with iteration diagnostics, printed after every AI-REML iteration and by `display(model)`), and `src/emai_post.jl` (post-fit `stochastic_loglik`, `loglik_difference` and `psi_score` for model comparison). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
 - `run_emai.jl`: runnable entrypoint; fits both the base SGE model and the SGE+household model, prints a comparison table
-- `run_emai_hpc.jl`: single-input HPC runner for `obs_table_<INPUT>.csv` / `roster_<INPUT>.csv` files and trimmed pedigree triplets
 - `computational_approach.md`: math and algorithm overview
 - `sim/`: simulation scripts in R (`sim_peer.R`, `sim_peer_evn.R`; `sim_peer_evn.R` adds household/classroom/school shared environment effects); each writes the two-table format (`yX_obs.csv`, `roster.csv`)
 - `yX_obs.csv`: observed-only rows — one row per observed outcome, with columns `y`, `id_ped`, covariates, and optional environment IDs (e.g. `household`)
@@ -62,55 +61,11 @@ The runner currently:
 
 Saving examples in the runner are commented out for the offline HPC environment.
 
-### Interactive R data preparation
+### Application scripts
 
-`setup_edu_data.R` is an editable, cell-based copy of the education setup.
-Configure its input paths and run the cells in order. It retains the screenshot
-version's class-size filter, earliest education-year rule, whole-class year
-exclusion, twin exclusion from outcomes, and fixed effects (no term-1 covariate).
-By default it writes a separate `data/edu10_MAT_checked` bundle.
-
-The exported observations include `household_imputed`, its complement
-`household_observed`, the target and actual household years, and
-`household_year_shifted`. A register-observed household from the 2015 fallback
-is **not** necessarily a household observed at the outcome date. Household IDs
-are still pooled across years as in the original; verify that register codes
-are longitudinally stable before interpreting that random effect.
-
-The script stops on conflicting grades in the earliest recorded year rather
-than choosing one by file order. It verifies source-person identities, parent
-edges, unchanged observation/design ordering, and the sparse factor identity
-after pedigree trimming and reversal. Pedigree reversal changes the pedigree
-row order and observation-to-pedigree IDs, **not** the observation row order.
-
-`diagnostics/diagnose_h2_household.R` checks repeated IDs, household sizes, and
-fixed-effect-adjusted sibling correlations. Between-household comparisons
-require an observed/imputed flag; household-stratified comparisons exclude
-explicitly shifted household years. These are descriptive correlations, not
-REML heritability estimates or independent-pair significance tests.
-
-Validate both R scripts on synthetic data with
-`Rscript tests/test_edu_data_setup.R`.
-
-### Single-input HPC runner
-
-`run_emai_hpc.jl` fits one input dataset and saves the complete fitted model.
-Edit `DATA_DIR`, `RUN_NAME`, the model block, and fitting options in the script;
-it takes no command-line model selector. Run it from the Julia project:
-
-```bash
-julia --threads "$SLURM_CPUS_PER_TASK" --project=. run_emai_hpc.jl
-```
-
-It reads `yX_obs.csv`, `X_obs.csv`, `roster.csv`, `Ainv_triplet.csv`
-(upper triangle of `Ainv`), and `LAinv_triplet.csv` (lower factor,
-`Ainv = L_Ainv * L_Ainv'`) from `DATA_DIR`. The CSV log, fitted model, and a
-copy of the run script are written under `DATA_DIR/fits`. Input checks are done
-by `load_observed_data`, `build_group_structure`, and `fit_aireml!`.
-
-When transferring an updated implementation, replace the Julia files under
-`src/` on the HPC system and start a new Julia process. This does not require
-overwriting an existing manually configured `run_emai_hpc.jl`.
+Data preparation, HPC runner and the interactive post-fit script for the
+education-register application live in `application/`, which is not tracked
+(see `.gitignore`). They are not part of the software package.
 
 ## Fitted Models And Inference Snapshots
 
@@ -201,31 +156,12 @@ struct compatibility.
 
 ## Post-Fit Inspection
 
-Set the single `data_dir` and editable `runs` list at the top of
-`post_fit.jl`. The defaults compare:
+`src/emai_post_compare.jl` compares fits of the same data that differ only in
+dilution (`compare_fits`, `comparison_plot`, `save_comparison`,
+`compare_likelihood`, `compare_psi_scores`). An interactive, data-specific
+driver script is kept locally in the untracked `application/` folder.
 
-- Mean: `ds_meandilution_class_household`
-- Sum: `ds_sum_dilution_class_household`
-- Estimated ψ: `ds_optdilution_class_household`
-
-Use the **original** `roster.csv`, `yX_obs.csv` and `fits/RUN_NAME.jld2`
-files in that directory. All fits must use identical observations, fixed
-effects, pedigree, social roster and random-effect designs apart from dilution.
-Full saved models are loaded one at a time and reduced to snapshots; their
-data/design fingerprints are checked. Snapshots can also be compared, but
-cannot establish equality of the original y, X or pedigree, so emit a warning.
-
-Open `post_fit.jl` in VS Code and start a Julia REPL with `--project=.`. Edit
-`data_dir` and `runs`, then execute the **Setup** and **Load and check the fits**
-cells. Run the other `##` sections individually to inspect the tables and plots
-you want. They leave `report` and the generated `figures` available in the
-REPL; creating one plot does not generate the others. Re-running Load clears
-the plot collection, preventing figures from different comparisons being mixed.
-The calculations live in `src/emai_post_compare.jl`, which must accompany the
-script when copying it to another machine.
-
-Run the **Save tables and the figures created so far** cell when you want to
-write output. It saves seven CSV tables and only the figures you generated to
+`save_comparison` writes seven CSV tables and only the figures generated so far to
 `data_dir/fits/comparison`, overwriting files with matching names. Other figures
 from an earlier save remain unchanged. The tables cover fit status and ψ/SE, raw and common-reference components,
 derived quantities, fixed effects, group-size curves, and pairwise BLUP

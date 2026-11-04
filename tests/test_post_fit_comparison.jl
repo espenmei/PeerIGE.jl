@@ -12,9 +12,14 @@ function comparison_result(res; kwargs...)
         getfield(res, name) for name in fieldnames(AiRemlResult))...)
 end
 
+# The interactive script lives in the untracked application/ folder; skip its checks when absent.
+const POST_FIT_SCRIPT = abspath(joinpath(@__DIR__, "..", "application", "post_fit.jl"))
+
 @testset "interactive setup in a fresh Julia session" begin
-    if Base.find_package("Plots") !== nothing
-        script = abspath(joinpath(@__DIR__, "..", "post_fit.jl"))
+    if !isfile(POST_FIT_SCRIPT)
+        @test_skip "application/post_fit.jl is not present"
+    elseif Base.find_package("Plots") !== nothing
+        script = POST_FIT_SCRIPT
         project = abspath(joinpath(@__DIR__, ".."))
         check_setup = raw"""
             using Test
@@ -183,8 +188,8 @@ end
 
             if !peer_env
                 @testset "interactive cells" begin
-                    if isdefined(@__MODULE__, :Plots)
-                        script = joinpath(@__DIR__, "..", "post_fit.jl")
+                    if isdefined(@__MODULE__, :Plots) && isfile(POST_FIT_SCRIPT)
+                        script = POST_FIT_SCRIPT
                         text = read(script, String)
                         cells = Dict(String(m.captures[1]) => String(m.captures[2]) for m in
                             eachmatch(r"(?ms)^## ([^\r\n]+)\r?\n(.*?)(?=^## |\z)", text))
@@ -231,7 +236,7 @@ end
                         @test !isfile(joinpath(report.output_dir, "likelihood.csv"))
                         @test !isfile(joinpath(report.output_dir, "psi_scores.csv"))
                     else
-                        @test_skip "Plots.jl is an optional global-environment dependency"
+                        @test_skip "Plots.jl or application/post_fit.jl is unavailable"
                     end
                 end
                 @testset "CSV and rendered plot outputs" begin

@@ -17,10 +17,17 @@ struct MMEOperator{T}
 end
 
 function make_mme_operator(model::SGEModel, ws::ThreadWorkspace)
+    λ = ws.op_Ginv
+    if !has_social(model)
+        # Direkte-only: skalar prior λ = σ²_e/σ²_d i [1,1]; resten brukes ikke.
+        fill!(λ, 0.0)
+        λ[1, 1] = model.σ2_e / model.σ2_d
+        return MMEOperator{Float64}(model, ws.op_wn, ws.op_wn2, ws.op_wdim,
+            ws.op_Ad, ws.op_As, λ, ws.group_sum)
+    end
     # Beregn Ginv * σ²_e uten allokering (2×2 inline)
     det_G = model.σ2_d * model.σ2_s - model.σ_ds^2
     inv_det = model.σ2_e / det_G
-    λ = ws.op_Ginv
     λ[1, 1] = model.σ2_s * inv_det
     λ[1, 2] = -model.σ_ds * inv_det
     λ[2, 1] = λ[1, 2]
@@ -68,13 +75,19 @@ function compute_Px_from_sol!(out::Vector{Float64}, model::SGEModel, y_vector::V
 
     # 2. Beregn y_hat in-place i out, deretter Px
     mul!(out, model.X, beta)
-    # Cache group_sum for soc så vi unngår å summere medlemmer per obs
-    compute_group_sums!(ws.group_sum, soc, gs.members_id)
-    @inbounds for i in 1:n
-        target_id = gs.obs_to_id[i]
-        out[i] += a_d[target_id]
-        g_idx = gs.obs_to_group[i]
-        out[i] += (ws.group_sum[g_idx] - soc[target_id]) * model.group_scale[g_idx]  # scaled peer sum (excl. self)
+    if has_social(model)
+        # Cache group_sum for soc så vi unngår å summere medlemmer per obs
+        compute_group_sums!(ws.group_sum, soc, gs.members_id)
+        @inbounds for i in 1:n
+            target_id = gs.obs_to_id[i]
+            out[i] += a_d[target_id]
+            g_idx = gs.obs_to_group[i]
+            out[i] += (ws.group_sum[g_idx] - soc[target_id]) * model.group_scale[g_idx]  # scaled peer sum (excl. self)
+        end
+    else
+        @inbounds for i in 1:n
+            out[i] += a_d[gs.obs_to_id[i]]
+        end
     end
 
     # + env contributions: Zh * ch
@@ -226,7 +239,8 @@ function (op::MMEOperator{T})(res, v) where T
         end
     end
 
-    # 2. SOSIALE EFFEKTER (res_s)
+    # 2. SOSIALE EFFEKTER (res_s) — hoppes over i direkte-only modell (tom social-range)
+    social = has_social(m)
     # Med peer env: Z_s v_s + Z_pe v_pe = Z_s w, w = v_s + scatter(v_pe) (Z_pe = Z_s[:, pe_ids]).
     # w lagres i op.Ad, som ikke brukes før apply_GinvAinv! overskriver den i steg 6.
     if m.peer_env
@@ -239,20 +253,22 @@ function (op::MMEOperator{T})(res, v) where T
     else
         v_soc = v_s
     end
-    # Krydsledd: Zs' * y_hat  (X*v_f + Zd*v_d + sum Zh*v_h) — ingen re-beregning
-    apply_Zs_transpose!(res_s, y_hat, gs, op.group_sum, m.group_scale)
-    # Ledd: Zs' * Zs * w
-    apply_ZsZs_accumulate!(res_s, v_soc, gs, m.group_scale)
+    if social
+        # Krydsledd: Zs' * y_hat  (X*v_f + Zd*v_d + sum Zh*v_h) — ingen re-beregning
+        apply_Zs_transpose!(res_s, y_hat, gs, op.group_sum, m.group_scale)
+        # Ledd: Zs' * Zs * w
+        apply_ZsZs_accumulate!(res_s, v_soc, gs, m.group_scale)
 
-    # 3. Fullfør y_hat: legg til Zs * w (gjenbruker workspace_n2)
-    tmp_zs = op.workspace_n2
-    fill!(tmp_zs, zero(T))
-    # Cache group_sum for w
-    compute_group_sums!(op.group_sum, v_soc, gs.members_id)
-    @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
-        tmp_zs[i] = (op.group_sum[gs.obs_to_group[i]] - v_soc[target_id]) * m.group_scale[gs.obs_to_group[i]]
+        # 3. Fullfør y_hat: legg til Zs * w (gjenbruker workspace_n2)
+        tmp_zs = op.workspace_n2
+        fill!(tmp_zs, zero(T))
+        # Cache group_sum for w
+        compute_group_sums!(op.group_sum, v_soc, gs.members_id)
+        @inbounds for (i, target_id) in enumerate(gs.obs_to_id)
+            tmp_zs[i] = (op.group_sum[gs.obs_to_group[i]] - v_soc[target_id]) * m.group_scale[gs.obs_to_group[i]]
+        end
+        y_hat .+= tmp_zs
     end
-    y_hat .+= tmp_zs
 
     # 3b. PEER ENV: res_pe = Z_pe' * y_hat + (σ²_e/σ²_pe) v_pe. Datadelen er lik res_s
     # i roster-ID-ene, og må hentes FØR genetisk prior legges til res_s i steg 6.
@@ -274,7 +290,13 @@ function (op::MMEOperator{T})(res, v) where T
     end
 
     # 6. GENETISK PRIOR — cached Ginv_scaled og preallokkerte Ad/As
-    apply_GinvAinv!(res_d, res_s, v_d, v_s, m.Ainv, op.Ginv_scaled, op.Ad, op.As)
+    if social
+        apply_GinvAinv!(res_d, res_s, v_d, v_s, m.Ainv, op.Ginv_scaled, op.Ad, op.As)
+    else
+        mul!(op.Ad, m.Ainv, v_d)
+        λ_d = op.Ginv_scaled[1, 1]
+        @. res_d += λ_d * op.Ad
+    end
 
     # 7. ENV BLOCKS: res_h = Zh' * y_hat + (σ²_e / σ²_h) * v_h
     for h in 1:H
@@ -303,7 +325,8 @@ function build_rhs!(rhs::Vector{Float64}, v::AbstractVector{Float64}, model::SGE
     for i in 1:n
         @inbounds rhs[nf+model.groups.obs_to_id[i]] += v[i]
     end
-    apply_Zs_transpose!(@view(rhs[lay.social]), v, model.groups, ws.group_sum, model.group_scale)
+    has_social(model) &&
+        apply_Zs_transpose!(@view(rhs[lay.social]), v, model.groups, ws.group_sum, model.group_scale)
     if model.peer_env
         # Z_pe' v = (Z_s' v)[pe_ids]
         rhs_s = @view(rhs[lay.social])

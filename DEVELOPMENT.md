@@ -65,16 +65,28 @@ Note: z-solves, trace estimation, and AI work are always threaded via the
 - `σ2_d`, `σ2_s`, and `σ2_e` must stay positive
 - `σ2_env[h]` must stay positive for each env factor `h`
 - `σ2_pe` must stay positive when `peer_env=true`; with `peer_env=false` the model, layout, and results must be bit-identical to the model without the feature
+- Direct-only models (`social=false`) have an empty `layout.social` and parameters `[σ2_d, σ2_e, σ2_env...]`; every social-specific code path must be guarded by `has_social(model)`, and the `social=true` path must stay bit-identical
 - Threaded paths must use thread-local mutable buffers only
 - `A` must never be formed explicitly; apply it through sparse triangular solves
 - Numerical guards like `max(..., 1e-6)` and step-halving are deliberate stability controls. Do not replace step-halving in `run_aireml` by per-component flooring in `update_params!`: an overshooting AI step then sends several variances to their floors in one iteration, after which AI-REML only climbs back by roughly a factor `(1+α)` per iteration (scores in the millions, estimates near zero for many iterations).
-- AI-REML starts with the requested `damping` and adapts the next iteration's step based on progress of the undamped correction in AI-SE units, up to `α=1`. Feasibility step-halving remains active. Convergence uses `max|Δ|/SE < 1e-2`, not only the realized damped change; `adaptive_damping=false` disables the progress-based adjustment.
+- AI-REML starts with the requested `damping` (capped at 1) and adapts the next iteration's step based on progress of the undamped correction in AI-SE units, up to `α=1`. Adaptation starts from the attempted α before feasibility halving, so a boundary-limited step cannot leave the fit stuck at α≈0. Feasibility step-halving remains active. Variances already at their floor whose AI step points outward are held fixed for that iteration (active set, `_boundary_constrained_delta`), instead of letting them force α≈0 for all parameters. Convergence uses `max|Δ|/SE < 1e-2`, not only the realized damped change; `adaptive_damping=false` retries the requested starting damping each iteration, even after an earlier step was halved.
+- The boundary AI solve must satisfy the local quadratic's optimality conditions: free gradients vanish, held lower-bound gradients are nonpositive, and boundary steps are nonnegative. Release a held variance on an inward **reduced** gradient; using only the full unconstrained step can pin correlated components incorrectly. This also applies to household/classroom effects with `peer_env=false`.
 - **Each `Threads.@threads :static` block must live in its own dedicated helper function.** Multiple consecutive `@threads` blocks within a single function corrupt each other's closure environments in Julia 1.12 (non-deterministic results). The helpers are: `_threaded_vi_py!`, `_threaded_trace!`, `_threaded_ai_cg!`, `_threaded_ai_matvec!`, `_threaded_z_solves!`.
 
 ## High-Risk Areas
 
 ### Fitted state and performance
 
+- After every iteration `fit_aireml!` prints a timing header (time, ETA, CG
+  reltol) followed by the same report as `display(model)`, built from a temporary
+  `AiRemlFit`; `model.fit` is only set after the final BLUE/BLUP solve, so an
+  interrupted fit still leaves `model.fit === nothing`. All report/diagnostics
+  code is in `src/emai_show.jl`: estimates with SE, score, undamped AI step
+  `Δ_AI`, `|Δ|/SE` per component (◀ marks the one blocking convergence) and start
+  values; fixed effects; settings; G health; AI eigenvalues/condition number;
+  sampling correlations from AI⁻¹ (`!` marks |r| > 0.9). It works for both
+  `AiRemlFit` and `AiRemlResult`, which store the same fields.
+  `verbose_cg=false` hides the sub-step progress messages (CG, z-solves, score/AI).
 - Model mutators (`fit_aireml!`, `fixed_effect_vcov!`, `update_params!`,
   model-owned `solve_mme_y!`/`solve_mme_z!`) return the same model.
   Buffer mutators return the destination, not the model whose inputs they read.

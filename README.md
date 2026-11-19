@@ -4,9 +4,10 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## What This Repository Contains
 
-- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), and `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
+- `src/emai.jl`: thin façade that loads the model. The implementation is split across `src/emai_core.jl` (shared types and observed-data / group construction), `src/emai_precond.jl` (diagonal and block preconditioners), `src/emai_mme.jl` (matrix-free mixed model equations, CG solves, `V_i` operators), `src/emai_aireml.jl` (Hutchinson trace probes, score/AI assembly, and the `fit_aireml!` driver), `src/emai_show.jl` (model report with iteration diagnostics, printed after every AI-REML iteration and by `display(model)`), and `src/emai_post.jl` (post-fit `stochastic_loglik`, `loglik_difference` and `psi_score` for model comparison). Together they fit the full social genetic effects model with variance components (`σ2_d`, `σ2_s`, `σ_ds`, `σ2_e`) plus optional shared environment effects
 - `run_emai.jl`: runnable entrypoint; fits both the base SGE model and the SGE+household model, prints a comparison table
 - `computational_approach.md`: math and algorithm overview
+- `docs/`: research notes on extensions not yet implemented (e.g. `docs/assortative_mating.md`, `docs/latent_mundlak_school_sorting.md`)
 - `sim/`: simulation scripts in R (`sim_peer.R`, `sim_peer_evn.R`; `sim_peer_evn.R` adds household/classroom/school shared environment effects); each writes the two-table format (`yX_obs.csv`, `roster.csv`)
 - `yX_obs.csv`: observed-only rows — one row per observed outcome, with columns `y`, `id_ped`, covariates, and optional environment IDs (e.g. `household`)
 - `roster.csv`: full social group membership for all relevant pedigree IDs, with columns `id_ped` and `group` (includes unobserved animals)
@@ -16,7 +17,7 @@ Julia code for AI-REML estimation of direct and social genetic effects in large 
 
 ## Folder Structure
 
-- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_precond.jl`, `emai_mme.jl`, `emai_aireml.jl`)
+- `src`: model implementation (`emai.jl` façade plus `emai_core.jl`, `emai_precond.jl`, `emai_mme.jl`, `emai_aireml.jl`, `emai_show.jl`, `emai_post.jl`)
 - `sim`: R simulation scripts that generate the input CSVs
 - `outputs/logs`: AI-REML and benchmark log CSVs
 - `outputs/results`: JLD2 model result files
@@ -61,6 +62,12 @@ The runner currently:
 
 Saving examples in the runner are commented out for the offline HPC environment.
 
+### Application scripts
+
+Data preparation, HPC runner and the interactive post-fit script for the
+education-register application live in `application/`, which is not tracked
+(see `.gitignore`). They are not part of the software package.
+
 ## Fitted Models And Inference Snapshots
 
 The fitted model is the primary object. Supply design-column names when building
@@ -69,7 +76,13 @@ it (`load_observed_data` also returns `fixef_names`):
 ```julia
 model = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.2, 0.0, 2.0;
     fixef_names=["(Intercept)", "x"])
-fit_aireml!(model; max_iter=25, k=20)  # returns the same model
+# Choose one fit call. ψ is fixed by default:
+fit_aireml!(model; max_iter=25, k=20)
+
+# Or estimate ψ jointly with the variance components. This requires variable
+# roster group sizes and centers scaling at their median:
+fit_aireml!(model; max_iter=50, k=64, estimate_ψ=true,
+    ψ_bounds=(0.0, 1.0), ψ_max_step=0.25)
 
 model.σ2_d                 # fitted variance component
 fixef(model)               # view of beta in the authoritative solution vector
@@ -85,6 +98,11 @@ result = snapshot(model)   # independent, no y/X/pedigree matrices or scratch
 save_results(result, "inference_snapshot.jld2")
 result = load_results("inference_snapshot.jld2")
 ```
+
+Every iteration header shows the current ψ and whether it is fixed or estimated.
+When `log_file` is set, the iteration CSV also includes a `psi` column in both
+cases; `se_psi` and `psi_score_mcse` are included only when ψ is estimated.
+The reported value is after that iteration's parameter update.
 
 `model.fit` stores AI, regularized variance-component covariance/SEs, score,
 initial parameters, convergence diagnostics, and fit settings. Variance
@@ -137,6 +155,60 @@ struct compatibility.
 - `outputs/logs/*.csv`: per-iteration timing, parameter estimates, scores, convergence diagnostics
 - `outputs/results/*.jld2`: optional complete `SGEModel` files or independent `AiRemlResult` snapshots
 
+## Post-Fit Inspection
+
+`src/emai_post_compare.jl` compares fits of the same data that differ only in
+dilution (`compare_fits`, `comparison_plot`, `save_comparison`,
+`compare_likelihood`, `compare_psi_scores`). An interactive, data-specific
+driver script is kept locally in the untracked `application/` folder.
+
+`save_comparison` writes seven CSV tables and only the figures generated so far to
+`data_dir/fits/comparison`, overwriting files with matching names. Other figures
+from an earlier save remain unchanged. The tables cover fit status and ψ/SE, raw and common-reference components,
+derived quantities, fixed effects, group-size curves, and pairwise BLUP
+correlations/RMSE/top-10% overlap. Plots include all component trajectories
+(including classroom/household), ψ, step length, convergence criterion, estimate
+correlation matrices and BLUP scatterplots. BLUP statistics use **all observed
+individuals**; only scatterplots use a reproducible sample of at most 20,000.
+Top-tail overlap is the fraction of equally sized top-10% sets shared by two
+fits (ties follow the common observation order). No BLUP prediction-error SEs
+are claimed; fixed-effect SEs appear only when already cached in the saved fit.
+
+Raw social variances/covariances are **not directly comparable**: estimated ψ
+uses centered scaling, while fixed ψ uses raw `(m-1)^(-ψ)` scaling. Common-scale
+tables use per-peer variance `c(m₀)^2 σ²_s`, covariance `c(m₀) σ_ds` and,
+if fitted, `c(m₀)^2 σ²_pe`, at the rounded median non-singleton roster size m₀.
+BLUP plots use `a_d`, `c(m₀) a_s`, and `a_d + (m₀-1)c(m₀)a_s`.
+Derived quantities and delta-method SEs include ψ and its cross-covariances when
+estimated. The reference phenotype variance/social variance received assume
+unrelated group members and omit focal-peer genetic covariance: these are
+reference-model summaries, **not** the empirical variance of y. `T²` can exceed 1.
+Intervals are approximate 95% Wald intervals, unreliable at boundaries or under
+weak identification. AI/SEs belong to the pre-last-update point; inspect
+`max_last_update` and convergence before interpreting them. Non-converged fits
+are visibly flagged and are not ranked by these descriptive plots.
+
+Expensive likelihood and ψ-score calculations are **never run automatically**.
+With full, converged models, explicitly run in a suitably sized batch job:
+
+```julia
+likelihood = compare_likelihood(report; K=64)
+scores = compare_psi_scores(report; K=64)  # fixed-ψ fits only
+```
+
+These also load one full model at a time. Likelihood differences are relative to
+the first configured fit and use paired probes with a shared seed; output
+includes Monte Carlo SEs, maximum Lanczos steps, the configured limit/tolerance,
+and counts of probes reaching that limit. MCSE does **not** include
+Lanczos truncation error: repeat with tighter tolerances/more steps before
+ranking close fits, and increase K if Monte Carlo uncertainty is too large.
+Score diagnostics require the other parameters to be at an optimum; boundaries
+or weak identification invalidate a naive normal interpretation. See
+`computational_approach.md`, Section 9.1. Matrix-free post-fit work can require
+substantial **per-thread** memory; start with few threads. Plots.jl is required
+in the global environment, deliberately not as a project dependency. On a
+headless node, set `ENV["GKSwstype"]="100"` before `using Plots`.
+
 ## Input File Contract
 
 The runner expects two CSV files in the working directory:
@@ -158,6 +230,22 @@ model = SGEModel(y, X, Ainv, L_Ainv, gs, 1.0, 0.05, 0.0, 2.0;
 ```
 
 `σ²_pe` is the last parameter in the score/AI/SE vectors and appears as `s2pe`/`se_pe` in the iteration log. `AiRemlResult` adds `σ2_pe`, `p_env` (BLUPs) and `pe_ids` (pedigree ID per BLUP). Against a classroom effect it is identified only through class-size variation, and against `σ2_s` only through relatedness. See `computational_approach.md` §1.7.
+
+## Direct-Only Model
+
+`SGEModel(...; social=false)` fits $y = X\beta + Z_d a_d + \sum_h Z_h c_h + e$ without the social genetic block. Use it, for example, for a direct + household + residual baseline:
+
+```julia
+model = SGEModel(y, X, Ainv, L_Ainv, gs, 0.7, 0.0, 0.0, 0.2; social=false,
+    env_ids=[household_ids], σ2_env=[0.02], env_names=["household"])
+fit_aireml!(model; max_iter=50, k=32)
+```
+
+- The positional `σ2_s` and `σ_ds` values are ignored and stored as 0. `gs` only maps observations to pedigree IDs; singleton groups are enough.
+- The parameter, score, AI and SE vectors are `[σ²_d, σ²_e, σ²_env...]`. The log columns are `s2d,s2e,s2env…`, with `rho_ds`/`cond_G` logged as `NaN`.
+- `peer_env`, nonzero `ψ`, `estimate_ψ` and `psi_score` are rejected. `compare_fits` only compares social fits.
+- To compare against a social fit, use `stochastic_loglik` on each fitted model and `loglik_difference`. The SE is unpaired because the MME dimensions differ.
+- `has_social(model)` reports which model type is in use.
 
 ## Current Working Assumptions
 

@@ -44,3 +44,6 @@ output_validation.txt
 # Editor / local
 .vscode/
 sim/_extract_docx.R
+
+# Application-specific data preparation, runners and post-fit scripts (local only)
+application/

@@ -52,20 +52,27 @@ function ldiv!(z::AbstractVector, P::BlockPreconditioner, r::AbstractVector)
     copyto!(tmp2, tmp1)
     ldiv!(P.L_Ainv', tmp2)         # tmp2 = A * r_d
 
-    # Fused: skriv G-blend for r_d + kopier r_s inn i tmp1
-    @inbounds @simd for i in 1:N
-        z[nf+i] = g11 * tmp2[i]
-        z[nf+N+i] = g21 * tmp2[i]
-        tmp1[i] = r[nf+N+i]
-    end
+    if isempty(P.layout.social)
+        # Direkte-only: M⁻¹ = (σ²_d/σ²_e) A
+        @inbounds @simd for i in 1:N
+            z[nf+i] = g11 * tmp2[i]
+        end
+    else
+        # Fused: skriv G-blend for r_d + kopier r_s inn i tmp1
+        @inbounds @simd for i in 1:N
+            z[nf+i] = g11 * tmp2[i]
+            z[nf+N+i] = g21 * tmp2[i]
+            tmp1[i] = r[nf+N+i]
+        end
 
-    ldiv!(P.L_Ainv, tmp1)
-    copyto!(tmp2, tmp1)
-    ldiv!(P.L_Ainv', tmp2)         # tmp2 = A * r_s
+        ldiv!(P.L_Ainv, tmp1)
+        copyto!(tmp2, tmp1)
+        ldiv!(P.L_Ainv', tmp2)         # tmp2 = A * r_s
 
-    @inbounds @simd for i in 1:N
-        z[nf+i] += g12 * tmp2[i]
-        z[nf+N+i] += g22 * tmp2[i]
+        @inbounds @simd for i in 1:N
+            z[nf+i] += g12 * tmp2[i]
+            z[nf+N+i] += g22 * tmp2[i]
+        end
     end
 
     # Env blocks: diagonal preconditioner
@@ -95,8 +102,8 @@ function get_preconditioner(model::SGEModel, ws::ThreadWorkspace)
         @inbounds diag_f_inv[j] = 1.0 / max(dot(@view(model.X[:, j]), @view(model.X[:, j])), 1e-6)
     end
 
-    # 2. Genetisk blokk: M⁻¹ = (G ⊗ A) / σ²_e
-    G = [model.σ2_d model.σ_ds; model.σ_ds model.σ2_s]
+    # 2. Genetisk blokk: M⁻¹ = (G ⊗ A) / σ²_e  (direkte-only: G = [σ²_d], g12=g21=g22=0)
+    G = has_social(model) ? genetic_covariance(model) : [model.σ2_d 0.0; 0.0 0.0]
     G_scaled = G ./ model.σ2_e
 
     # 3. Env blocks: diag preconditioner  1 / (count_j + σ²_e / σ²_h)
@@ -124,9 +131,8 @@ function get_diag_preconditioner(model::SGEModel)
     gs = model.groups
 
     diag_Ainv = diag(model.Ainv)
-    Ginv = inv([model.σ2_d model.σ_ds; model.σ_ds model.σ2_s])
+    Ginv = inv(genetic_covariance(model))
     λ_dd = Ginv[1, 1] * model.σ2_e
-    λ_ss = Ginv[2, 2] * model.σ2_e
 
     dim = get_dim(model)
     d = zeros(dim)
@@ -146,18 +152,21 @@ function get_diag_preconditioner(model::SGEModel)
 
     # 3. Sosial genetikk: diag(Zs'Zs) + Ainv * λ_ss
     # diag(Zs'Zs)[bid] = o_g - is_observed[bid]   for bid ∈ members_g, m_g >= 2
-    diag_ZsZs = @view d[lay.social]
-    for g in eachindex(gs.members_id)
-        members = gs.members_id[g]
-        if length(members) > 1
-            o_g = gs.obs_count_per_group[g]
-            c2_g = model.group_scale[g]^2
-            for id in members
-                @inbounds diag_ZsZs[id] += (o_g - (gs.is_observed[id] ? 1 : 0)) * c2_g
+    if has_social(model)
+        λ_ss = Ginv[2, 2] * model.σ2_e
+        diag_ZsZs = @view d[lay.social]
+        for g in eachindex(gs.members_id)
+            members = gs.members_id[g]
+            if length(members) > 1
+                o_g = gs.obs_count_per_group[g]
+                c2_g = model.group_scale[g]^2
+                for id in members
+                    @inbounds diag_ZsZs[id] += (o_g - (gs.is_observed[id] ? 1 : 0)) * c2_g
+                end
             end
         end
+        @. d[lay.social] = diag_ZsZs + diag_Ainv * λ_ss
     end
-    @. d[lay.social] = diag_ZsZs + diag_Ainv * λ_ss
 
     # 4. Env blocks: diag(Zh'Zh) + σ²_e/σ²_h = count_j + λ_h
     for h in 1:length(model.env_ids)

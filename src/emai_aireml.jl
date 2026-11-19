@@ -5,12 +5,12 @@
 # =====================================================================
 # Returnerer varianstype-representasjon for gjeldende modell (d, s, ds, e, env_h)
 function get_variance_components(model::SGEModel)
-    comps = VarianceComponent[
+    comps = has_social(model) ? VarianceComponent[
         VarianceComponent(VC_D, 0),
         VarianceComponent(VC_S, 0),
         VarianceComponent(VC_DS, 0),
         VarianceComponent(VC_E, 0)
-    ]
+    ] : VarianceComponent[VarianceComponent(VC_D, 0), VarianceComponent(VC_E, 0)]
     for h in 1:length(model.env_ids)
         push!(comps, VarianceComponent(VC_ENV, h))
     end
@@ -20,32 +20,36 @@ function get_variance_components(model::SGEModel)
     return comps
 end
 
-function get_param_names(model::SGEModel)
-    names = ["σ²_d", "σ²_s", "σ_ds", "σ²_e"]
+function get_param_names(model::SGEModel; include_ψ::Bool=_fit_estimates_psi(model))
+    names = has_social(model) ? ["σ²_d", "σ²_s", "σ_ds", "σ²_e"] : ["σ²_d", "σ²_e"]
     for h in 1:length(model.env_ids)
         push!(names, "σ²_env$h")
     end
     model.peer_env && push!(names, "σ²_pe")
+    include_ψ && push!(names, "ψ")
     return names
 end
 
 function compute_score_and_ai(model::SGEModel, Py, z_list, Pz_list, workspaces, preconditioners;
-    ai_reltol=1e-5, ai_maxiter=500)
+    ai_reltol=1e-5, ai_maxiter=500, verbose=true, estimate_ψ::Bool=false,
+    return_psi_mcse::Bool=false)
     comps = get_variance_components(model)
     n_p = length(comps)
     score = zeros(n_p)
     AI = zeros(n_p, n_p)
     k = length(Pz_list)
     n = length(Py)
+    estimate_ψ && k < 2 &&
+        throw(ArgumentError("Estimating ψ requires at least two trace probes"))
 
     # 1. Forhåndsberegn alle Vi * Py
-    println("    -> Beregner Vi * Py...")
+    verbose && println("    -> Beregner Vi * Py...")
     Vi_Py_list = [Vector{Float64}(undef, n) for _ in 1:n_p]
     _threaded_vi_py!(Vi_Py_list, Py, comps, model, workspaces)
 
     # 2. SCORE: s_i = 0.5 * (y'P * Vi * Py - tr(P * Vi))
     #    Trace-estimering: parallelliser k get_Vi_u-kall per parameter
-    println("    -> Beregner trace (k=$k)...")
+    verbose && println("    -> Beregner trace (k=$k)...")
     n_trace = n_p * k
     trace_results = zeros(n_trace)
     _threaded_trace!(trace_results, n_trace, k, Pz_list, z_list, comps, model, workspaces)
@@ -57,7 +61,7 @@ function compute_score_and_ai(model::SGEModel, Py, z_list, Pz_list, workspaces, 
     # 3. AI-MATRISE (Average Information)
     #    Trenger bare n_p CG-solves (én per V_j).
     #    AI[i,j] = 0.5 * Py' * Vi * P * Vj * Py
-    println("    -> Beregner AI-matrise ($n_p CG-solves)...")
+    verbose && println("    -> Beregner AI-matrise ($(n_p + (estimate_ψ ? 1 : 0)) CG-solves)...")
 
     # Steg 1: Beregn P * V_j * Py
     P_Vi_Py_list = [Vector{Float64}(undef, n) for _ in 1:n_p]
@@ -71,7 +75,41 @@ function compute_score_and_ai(model::SGEModel, Py, z_list, Pz_list, workspaces, 
         AI[i_idx, j_idx] = ai_vals[idx]
         AI[j_idx, i_idx] = ai_vals[idx]
     end
-    return score, AI
+
+    psi_mcse = NaN
+    if estimate_ψ
+        ψ_idx = n_p + 1
+        λ = _psi_log_weights(model; centered=true)
+        QPy = zeros(n)
+        _apply_Q!(QPy, Py, model, workspaces[1])
+        VdotPy = zeros(n)
+        _apply_Qt!(VdotPy, λ .* Py, model, workspaces[1])
+        @. VdotPy += λ * QPy
+
+        trace_terms = zeros(k)
+        Qz_list = [zeros(n) for _ in 1:k]
+        Threads.@threads :static for j in 1:k
+            tid = Threads.threadid()
+            ws = workspaces[tid]
+            Qz = Qz_list[j]
+            _apply_Q!(Qz, z_list[j], model, ws)
+            trace_terms[j] = 2 * dot(Pz_list[j], λ .* Qz)
+        end
+        score = vcat(score, 0.5 * (dot(Py, VdotPy) - mean(trace_terms)))
+        psi_mcse = 0.5 * std(trace_terms) / sqrt(k)
+
+        PVdotPy = [zeros(n)]
+        _threaded_ai_cg!(PVdotPy, [VdotPy], model, workspaces, preconditioners,
+            ai_reltol, ai_maxiter)
+        AI_aug = zeros(n_p + 1, n_p + 1)
+        AI_aug[1:n_p, 1:n_p] .= AI
+        for i in 1:n_p
+            AI_aug[i, ψ_idx] = AI_aug[ψ_idx, i] = 0.5 * dot(Vi_Py_list[i], PVdotPy[1])
+        end
+        AI_aug[ψ_idx, ψ_idx] = 0.5 * dot(VdotPy, PVdotPy[1])
+        AI = AI_aug
+    end
+    return return_psi_mcse ? (score, AI, psi_mcse) : (score, AI)
 end
 
 # --- Helper functions: each wraps a single @threads block to isolate closures ---
@@ -181,100 +219,6 @@ struct AiRemlResult
     settings::AiRemlSettings
 end
 
-function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_se,
-    param_names, params, param_se, converged, n_iter, step_crit, alpha;
-    env_names=String[], env_levels=Int[], peer_env=false, ψ=0.0, fitted=true)
-    println(io, "AI-REML fit")
-    println(io, "  Status: ", fitted ? (converged ? "converged" : "not converged") : "not fitted")
-    println(io, "  Data:   ", n_obs, " observations; ", n_pedigree, " pedigree members")
-    println(io, "  Design: ", length(fixef_names), " fixed effects; ",
-        length(env_names), " shared environment factor(s)",
-        peer_env ? "; peer environment enabled" : "")
-    if !isempty(env_names)
-        println(io, "  Environment levels: ",
-            join(["$(env_names[i])=$(env_levels[i])" for i in eachindex(env_names)], ", "))
-    end
-    if fitted
-        println(io, "  Fit:    ", n_iter, " iteration(s); α=", @sprintf("%.3g", alpha),
-            "; max|Δ|/SE=", @sprintf("%.3g", step_crit))
-        println(io, "  ψ:      ", ψ)
-        println(io)
-        println(io, "Variance components")
-        println(io, "  ", rpad("Component", 18), lpad("Estimate", 14), lpad("SE", 14))
-        for i in eachindex(param_names)
-            print(io, "  ", rpad(param_names[i], 18),
-                lpad(@sprintf("%.6g", params[i]), 14))
-            if i <= length(param_se)
-                println(io, lpad(@sprintf("%.6g", param_se[i]), 14))
-            else
-                println(io, lpad("not available", 14))
-            end
-        end
-
-        if !isempty(fixef_names)
-            println(io)
-            println(io, "Fixed effects")
-            println(io, "  ", rpad("Name", 24), lpad("Estimate", 14), lpad("SE", 14))
-            max_rows = max(1, min(12, displaysize(io)[1] - 18))
-            n_show = min(length(fixef_names), max_rows)
-            for i in 1:n_show
-                print(io, "  ", rpad(fixef_names[i], 24),
-                    lpad(@sprintf("%.6g", beta[i]), 14))
-                if beta_se !== nothing
-                    println(io, lpad(@sprintf("%.6g", beta_se[i]), 14))
-                else
-                    println(io, lpad("not computed", 14))
-                end
-            end
-            n_show < length(fixef_names) &&
-                println(io, "  … ", length(fixef_names) - n_show, " more fixed effects")
-            beta_se === nothing &&
-                println(io, "  Fixed-effect SEs have not been computed.")
-        end
-    end
-    return nothing
-end
-
-function Base.show(io::IO, ::MIME"text/plain", model::SGEModel)
-    fit = model.fit
-    if fit === nothing
-        return _show_aireml_report(io, length(model.y), size(model.Ainv, 1),
-            model.fixef_names, Float64[], nothing, String[], Float64[], Float64[],
-            false, 0, NaN, NaN; env_names=model.env_names,
-            env_levels=model.env_n_levels, peer_env=model.peer_env, ψ=model.ψ,
-            fitted=false)
-    end
-    beta_se = fit.beta_vcov === nothing ? nothing : sqrt.(diag(fit.beta_vcov))
-    return _show_aireml_report(io, length(model.y), size(model.Ainv, 1),
-        model.fixef_names, view(model.sol_y, model.layout.fixed), beta_se,
-        get_param_names(model), get_params(model), fit.se,
-        fit.converged, fit.n_iter, fit.step_crit, fit.alpha;
-        env_names=model.env_names, env_levels=model.env_n_levels,
-        peer_env=model.peer_env, ψ=model.ψ)
-end
-
-function Base.show(io::IO, ::MIME"text/plain", result::AiRemlResult)
-    env_levels = [length(ids) == 0 ? 0 : maximum(ids) for ids in result.env_ids]
-    return _show_aireml_report(io, result.n_obs, result.N_pedigree,
-        result.fixef_names, result.beta, result.beta_se,
-        result.param_names, vcat([result.σ2_d, result.σ2_s, result.σ_ds, result.σ2_e],
-            result.σ2_env, result.peer_env ? [result.σ2_pe] : Float64[]),
-        result.se, result.converged, result.n_iter, result.step_crit, result.alpha;
-        env_names=result.env_names, env_levels=env_levels,
-        peer_env=result.peer_env, ψ=result.ψ)
-end
-
-function Base.show(io::IO, model::SGEModel)
-    print(io, "SGEModel(", model.fit === nothing ? "not fitted" : "fitted",
-        ", n=", length(model.y), ", N=", size(model.Ainv, 1), ")")
-end
-
-function Base.show(io::IO, result::AiRemlResult)
-    print(io, "AiRemlResult(", result.converged ? "converged" : "not converged",
-        ", n_iter=", result.n_iter, ", n=", result.n_obs,
-        ", N=", result.N_pedigree, ")")
-end
-
 function fitted_state(model::SGEModel)
     fit = model.fit
     fit === nothing && throw(ArgumentError("Model has not been fitted; call fit_aireml! first"))
@@ -374,25 +318,116 @@ end
 load_model(filename::String) = load(filename, "model")
 
 function update_params!(model::SGEModel, delta, damping)
+    ie = e_param_index(model)
     # Foreslåtte endringer
     new_d2 = model.σ2_d + damping * delta[1]
-    new_s2 = model.σ2_s + damping * delta[2]
-    new_ds = model.σ_ds + damping * delta[3]
-    new_e2 = model.σ2_e + damping * delta[4]
+    new_e2 = model.σ2_e + damping * delta[ie]
     # Sikkerhetsmekanismer (Bending)
     model.σ2_d = max(1e-4, new_d2)
-    model.σ2_s = max(1e-6, new_s2)
     model.σ2_e = max(1e-2, new_e2)
-    # Hold korrelasjonen i sjakk: |rho| < 0.99
-    max_cov = 0.99 * sqrt(model.σ2_d * model.σ2_s)
-    model.σ_ds = clamp(new_ds, -max_cov, max_cov)
+    if has_social(model)
+        new_s2 = model.σ2_s + damping * delta[2]
+        new_ds = model.σ_ds + damping * delta[3]
+        model.σ2_s = max(1e-6, new_s2)
+        # Hold korrelasjonen i sjakk: |rho| < 0.99
+        max_cov = 0.99 * sqrt(model.σ2_d * model.σ2_s)
+        model.σ_ds = clamp(new_ds, -max_cov, max_cov)
+    end
     # Env variances
     for h in 1:length(model.σ2_env)
-        model.σ2_env[h] = max(1e-6, model.σ2_env[h] + damping * delta[4+h])
+        model.σ2_env[h] = max(1e-6, model.σ2_env[h] + damping * delta[ie+h])
     end
     if model.peer_env
         model.σ2_pe = max(1e-6, model.σ2_pe + damping * delta[pe_param_index(model)])
     end
+    return model
+end
+
+const BOUNDARY_TOL = 1e-5
+
+# Maximize score'Δ - Δ'AI_reg*Δ/2 with Δ_i >= 0 for variances near their floor.
+# Release active constraints using the reduced quadratic's gradient, not the full
+# unconstrained step: correlations can otherwise pin a component with a positive score.
+# Boundary candidates: σ²_s (social models), σ²_env_h and σ²_pe; never σ²_d, σ_ds or σ²_e.
+function _boundary_constrained_delta(AI_reg, score, params;
+    variance_count::Int=length(params), social::Bool=true)
+    candidates = [i for i in (social ? vcat(2, collect(5:variance_count)) : collect(3:variance_count))
+        if params[i] <= BOUNDARY_TOL]
+    delta = AI_reg \ score
+    all(i -> delta[i] >= 0, candidates) && return delta, Int[]
+
+    active = copy(candidates)
+    fill!(delta, 0.0)
+    for _ in 1:max(100, 10 * length(score)^2)
+        free = setdiff(eachindex(score), active)
+        trial = zeros(length(score))
+        trial[free] = AI_reg[free, free] \ score[free]
+        blocking = [i for i in candidates if !(i in active) && trial[i] < 0]
+        if !isempty(blocking)
+            fractions = [delta[i] / (delta[i] - trial[i]) for i in blocking]
+            fraction, pos = findmin(fractions)
+            delta .+= fraction .* (trial .- delta)
+            i = blocking[pos]
+            delta[i] = 0.0
+            push!(active, i)
+            continue
+        end
+
+        delta = trial
+        gradient = score - AI_reg * delta
+        tol = 100 * eps(Float64) *
+            max(1.0, norm(score, Inf), norm(AI_reg, Inf) * norm(delta, 1))
+        isempty(active) && return delta, active
+        inward, pos = findmax(gradient[active])
+        inward <= tol && return delta, sort(active)
+        deleteat!(active, pos)
+    end
+    error("Boundary-constrained AI step did not satisfy its optimality conditions")
+end
+
+function _boundary_constrained_delta(model::SGEModel, AI_reg, score)
+    return _boundary_constrained_delta(AI_reg, score, get_params(model);
+        variance_count=_base_param_count(model), social=has_social(model))
+end
+
+function _psi_reference_size(model::SGEModel)
+    sizes = [length(members) for members in model.groups.members_id if length(members) > 1]
+    isempty(sizes) && throw(ArgumentError("Cannot estimate ψ: no peer groups with at least two members"))
+    length(unique(sizes)) > 1 ||
+        throw(ArgumentError("Cannot estimate ψ: peer-group roster sizes do not vary"))
+    return median(sizes)
+end
+
+function _set_group_scale!(model::SGEModel; centered::Bool)
+    ref_peers = centered ? _psi_reference_size(model) - 1 : 1.0
+    model.group_scale .= [
+        length(members) <= 1 ? 0.0 :
+        ((length(members) - 1.0) / ref_peers)^(-model.ψ)
+        for members in model.groups.members_id
+    ]
+    if model.peer_env
+        model.pe_ids, model.pe_data_diag = build_peer_env_levels(model.groups, model.group_scale)
+    end
+    return model
+end
+
+function _convert_psi_scale!(model::SGEModel; to_centered::Bool)
+    ref_peers = _psi_reference_size(model) - 1
+    factor = ref_peers^model.ψ
+    if to_centered
+        model.σ2_s /= factor^2
+        model.σ_ds /= factor
+        model.peer_env && (model.σ2_pe /= factor^2)
+        model.sol_y[model.layout.social] ./= factor
+        model.peer_env && (model.sol_y[model.layout.pe] ./= factor)
+    else
+        model.σ2_s *= factor^2
+        model.σ_ds *= factor
+        model.peer_env && (model.σ2_pe *= factor^2)
+        model.sol_y[model.layout.social] .*= factor
+        model.peer_env && (model.sol_y[model.layout.pe] .*= factor)
+    end
+    _set_group_scale!(model; centered=to_centered)
     return model
 end
 
@@ -432,28 +467,40 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
     use_block_precond=true, verbose_cg=true,
     adaptive_damping::Bool=true,
     log_file::String="",
-    seed::Int=42, refit::Bool=false)
+    seed::Int=42, refit::Bool=false,
+    estimate_ψ::Bool=false, ψ_bounds::Tuple{Float64,Float64}=(0.0, 1.0),
+    ψ_max_step::Float64=0.25)
     isfinite(damping) && damping > 0 ||
         throw(ArgumentError("damping must be finite and positive"))
     max_iter > 0 || throw(ArgumentError("max_iter must be positive"))
     k > 0 || throw(ArgumentError("k must be positive"))
+    estimate_ψ && k < 2 &&
+        throw(ArgumentError("Estimating ψ requires k ≥ 2 to estimate its Monte Carlo SE"))
+    estimate_ψ && !has_social(model) &&
+        throw(ArgumentError("estimate_ψ requires the social model; this model has social=false"))
     cg_maxiter > 0 && ai_maxiter > 0 ||
         throw(ArgumentError("CG iteration limits must be positive"))
     all(t -> isfinite(t) && t > 0, (cg_reltol, cg_reltol_early, ai_reltol)) ||
         throw(ArgumentError("CG tolerances must be finite and positive"))
     cg_early_iters >= 0 || throw(ArgumentError("cg_early_iters must be nonnegative"))
+    isfinite(ψ_max_step) && ψ_max_step > 0 ||
+        throw(ArgumentError("ψ_max_step must be finite and positive"))
+    all(isfinite, ψ_bounds) && ψ_bounds[1] < ψ_bounds[2] ||
+        throw(ArgumentError("ψ_bounds must be finite and strictly increasing"))
+    estimate_ψ && !(ψ_bounds[1] <= model.ψ <= ψ_bounds[2]) &&
+        throw(ArgumentError("Starting ψ=$(model.ψ) is outside ψ_bounds=$ψ_bounds"))
     model.fit === nothing || refit ||
         throw(ArgumentError("Model is already fitted; pass refit=true to fit again"))
+    previously_estimated_ψ = _fit_estimates_psi(model)
     settings = AiRemlSettings(; max_iter, k, damping, cg_maxiter, cg_reltol,
         cg_reltol_early, cg_early_iters, ai_maxiter, ai_reltol,
         use_block_precond, verbose_cg, adaptive_damping, log_file, seed)
-    initial_params = get_params(model)
     model.fit = nothing
     n = length(model.y)
     N = size(model.Ainv, 1)
     dim = length(model.sol_y)
     H = length(model.env_ids)
-    param_names = get_param_names(model)
+    param_names = get_param_names(model; include_ψ=estimate_ψ)
     n_p = length(param_names)
 
     nt = Threads.nthreads()
@@ -475,6 +522,11 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
     factor_error = validate_pedigree_factor(model, workspaces[1])
     @printf("Pedigree factor check: max relative residual=%.2e\n", factor_error)
 
+    if estimate_ψ != previously_estimated_ψ
+        _convert_psi_scale!(model; to_centered=estimate_ψ)
+    end
+    initial_params = get_params(model; include_ψ=estimate_ψ)
+
     precond_name = use_block_precond ? "Block" : "Diag"
     println("Starter AI-REML: k=$k, damping=$damping, precond=$precond_name, cg_maxiter=$cg_maxiter, threads=$nt")
     println("CG reltol schedule: early=$cg_reltol_early (iter <= $cg_early_iters), late=$cg_reltol")
@@ -488,11 +540,16 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
         open(log_file, "w") do io
             pe_cols = model.peer_env ? ",s2pe" : ""
             pe_se_cols = model.peer_env ? ",se_pe" : ""
-            param_cols = join(["s2d","s2s","sds","s2e", ["s2env$h" for h in 1:H]...], ",") * pe_cols
-            se_cols = join(["se_d","se_s","se_ds","se_e", ["se_env$h" for h in 1:H]...], ",") * pe_se_cols
+            psi_se_cols = estimate_ψ ? ",se_psi" : ""
+            base_cols, base_se = has_social(model) ?
+                (["s2d","s2s","sds","s2e"], ["se_d","se_s","se_ds","se_e"]) :
+                (["s2d","s2e"], ["se_d","se_e"])
+            param_cols = join([base_cols..., ["s2env$h" for h in 1:H]...], ",") * pe_cols * ",psi"
+            se_cols = join([base_se..., ["se_env$h" for h in 1:H]...], ",") * pe_se_cols * psi_se_cols
             println(io, "iter,time_y,time_z,time_ai,time_total,cum_time,eta_min,",
                 param_cols, ",", se_cols, ",",
-                "score_norm,step_crit,alpha,rho_ds,cond_G,converged")
+                "score_norm,step_crit,alpha,rho_ds,cond_G,converged",
+                estimate_ψ ? ",psi_score_mcse" : "")
         end
         println("Iterasjonslogg skrives til: $log_file")
     end
@@ -547,10 +604,20 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
             flush(stdout)
         end
         t_ai = @elapsed begin
-            score, AI_new = compute_score_and_ai(model, Py, z_fixed_list, Pz_list,
-                workspaces, preconditioners,
-                ai_reltol=ai_reltol, ai_maxiter=ai_maxiter)
+            if estimate_ψ
+                score, AI_new, psi_mcse = compute_score_and_ai(model, Py, z_fixed_list, Pz_list,
+                    workspaces, preconditioners,
+                    ai_reltol=ai_reltol, ai_maxiter=ai_maxiter, verbose=verbose_cg,
+                    estimate_ψ=true, return_psi_mcse=true)
+            else
+                score, AI_new = compute_score_and_ai(model, Py, z_fixed_list, Pz_list,
+                    workspaces, preconditioners,
+                    ai_reltol=ai_reltol, ai_maxiter=ai_maxiter, verbose=verbose_cg)
+            end
             copyto!(AI, AI_new)
+        end
+        if estimate_ψ
+            @printf("    ψ score Monte Carlo SE=%.3e (k=%d)\n", psi_mcse, k)
         end
         if verbose_cg
             @printf("    Score + AI ferdig: %.1fs\n", t_ai)
@@ -559,37 +626,62 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
 
         # 4. Løs systemet og beregn Standardfeil (SE)
         AI_reg = AI + 1e-6 * I
-        delta = AI_reg \ score
+        delta, boundary_active = _boundary_constrained_delta(model, AI_reg, score)
+        if !isempty(boundary_active)
+            names = _display_param_names(get_param_names(model; include_ψ=estimate_ψ),
+                model.env_names)
+            println("    Fixed at lower bound this iteration: ",
+                join(names[boundary_active], ", "))
+        end
         AI_inv = inv(AI_reg)
         se = sqrt.(abs.(diag(AI_inv)))
+        applied_delta = copy(delta)
+        ψ_idx = n_p
+        if estimate_ψ
+            applied_delta[ψ_idx] = clamp(delta[ψ_idx], -ψ_max_step, ψ_max_step)
+            applied_delta[ψ_idx] =
+                clamp(model.ψ + applied_delta[ψ_idx], ψ_bounds...) - model.ψ
+        end
 
-        # 5. Lagre gamle verdier for utskrift
-        old_params = get_params(model)
-        copyto!(ai_params, old_params)
+        # 5. Lagre AI-evalueringspunktet (brukes av show for Δparam)
+        copyto!(ai_params, get_params(model; include_ψ=estimate_ψ))
 
         # 6. Step-halving: finn steglengde som holder alle varianser > 0 og G positiv definitt.
+        # Komponenter allerede på gulvet med utovervendt steg er holdt fast over (aktiv mengde).
         # Må ikke erstattes av ren komponentvis projeksjon i update_params!: et overskytende
         # AI-steg sender da flere varianser til gulvet i én iterasjon, og AI-REML klatrer
         # deretter bare ca. faktor (1+α) per iterasjon tilbake (scorer i millioner).
-        α = alpha_next
+        α = adaptive_damping ? alpha_next : min(Float64(damping), 1.0)
+        α_start = α
+        social = has_social(model)
+        ie = e_param_index(model)
         for _attempt in 1:20
-            new_d = model.σ2_d + α * delta[1]
-            new_s = model.σ2_s + α * delta[2]
-            new_ds = model.σ_ds + α * delta[3]
-            new_e = model.σ2_e + α * delta[4]
-            env_ok = all(model.σ2_env[h] + α * delta[4+h] > 1e-8 for h in 1:H)
-            pe_ok = !model.peer_env || model.σ2_pe + α * delta[pe_param_index(model)] > 1e-8
-            if new_d > 1e-6 && new_s > 1e-8 && new_e > 1e-4 && new_d * new_s > new_ds^2 && env_ok && pe_ok
+            new_d = model.σ2_d + α * applied_delta[1]
+            new_e = model.σ2_e + α * applied_delta[ie]
+            g_ok = if social
+                new_s = model.σ2_s + α * applied_delta[2]
+                new_ds = model.σ_ds + α * applied_delta[3]
+                new_s > 1e-8 && new_d * new_s > new_ds^2
+            else
+                true
+            end
+            env_ok = all(model.σ2_env[h] + α * applied_delta[ie+h] > 1e-8 for h in 1:H)
+            pe_ok = !model.peer_env || model.σ2_pe + α * applied_delta[pe_param_index(model)] > 1e-8
+            ψ_ok = !estimate_ψ || ψ_bounds[1] <= model.ψ + α * applied_delta[ψ_idx] <= ψ_bounds[2]
+            if new_d > 1e-6 && new_e > 1e-4 && g_ok && env_ok && pe_ok && ψ_ok
                 break
             end
             α *= 0.5
         end
 
         # 7. Oppdater parametere med safe steglengde (update_params! gulv er siste skanse)
-        update_params!(model, delta, α)
+        update_params!(model, applied_delta, α)
+        if estimate_ψ
+            model.ψ = clamp(model.ψ + α * applied_delta[ψ_idx], ψ_bounds...)
+            _set_group_scale!(model; centered=true)
+        end
         last_alpha = α
-        new_params = get_params(model)
-        actual_change = new_params .- old_params
+        new_params = get_params(model; include_ψ=estimate_ψ)
 
         # --- UTSKRIFT ---
         t_iter = time() - t_iter_start
@@ -599,54 +691,25 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
         remaining_iters = max_iter - iter
         eta_min = remaining_iters * avg_iter / 60.0
 
-        # G-matrise helse
-        rho_ds = model.σ_ds / sqrt(model.σ2_d * model.σ2_s)
-        G_mat = [model.σ2_d model.σ_ds; model.σ_ds model.σ2_s]
-        eig_G = eigvals(G_mat)
-        cond_G = maximum(eig_G) / max(minimum(eig_G), 1e-12)
-
+        # G-matrise helse (ikke definert for direkte-only: logges som NaN)
+        rho_ds, cond_G = social ? _g_health(model.σ2_d, model.σ2_s, model.σ_ds)[1:2] : (NaN, NaN)
         score_norm = norm(score)
-
-        println("\n" * "="^70)
-        @printf("ITERASJON %d  (α=%.3f)  |  %.1fs (y:%.1f z:%.1f ai:%.1f)  cum:%.0fs  ETA:%.0fmin\n",
-            iter, α, t_iter, t_y, t_z, t_ai, cum_time, eta_min)
-        println("="^70)
-        @printf("CG reltol this iter: %.1e\n", iter_cg_reltol)
-        @printf("%-10s %-12s %-12s %-12s %-12s\n", "Param", "Est", "SE", "Score", "Delta")
-        println("-"^70)
-        for i in 1:n_p
-            @printf("%-10s %-12.6f %-12.6f %-+12.4f %-+12.6f\n",
-                param_names[i], new_params[i], se[i], score[i], delta[i])
-        end
-        println("-"^70)
-        @printf("G: ρ_ds=%.4f  cond(G)=%.1f  eig=[%.4f, %.4f]",
-            rho_ds, cond_G, eig_G[1], eig_G[2])
-        if abs(rho_ds) > 0.95
-            print("  ⚠ ρ nær grense!")
-        end
-        if cond_G > 1e4
-            print("  ⚠ dårlig kondisjonert!")
-        end
-        println()
-        if model.peer_env
-            # Sampling-korrelasjoner fra AI⁻¹: σ²_pe er nært konfundert med σ²_s og gruppe-env
-            ip = pe_param_index(model)
-            print("corr(σ²_pe, ·):")
-            for i in 1:n_p
-                i == ip && continue
-                r = AI_inv[ip, i] / sqrt(abs(AI_inv[ip, ip] * AI_inv[i, i]))
-                @printf("  %s=%+.2f", param_names[i], r)
-            end
-            println()
-        end
 
         # Use the undamped AI correction in units of its estimated standard errors;
         # a tiny feasible/damped step alone is not evidence of convergence.
-        step_crit = maximum(abs.(delta) ./ max.(se, eps()))
-        relative_change = norm(actual_change) / norm(old_params)
+        step_crit = maximum(abs.(applied_delta) ./ max.(se, eps()))
         converged = isfinite(step_crit) && step_crit < 1e-2
-        @printf("|score|=%.4e  Δparam=%.6f  max|Δ|/SE=%.3e",
-            score_norm, relative_change, step_crit)
+
+        # Iterasjonsrapport = samme rapport som display(model). model.fit settes ikke her:
+        # sol_y hører til variansene før oppdateringen, så modellen er ikke ferdig tilpasset.
+        println("\n", "="^90)
+        @printf("ITERASJON %d  |  %.1fs (y:%.1f z:%.1f ai:%.1f)  cum:%.0fs  ETA:%.0fmin  |  ψ=%.8g (%s)  |  CG reltol %.0e\n",
+            iter, t_iter, t_y, t_z, t_ai, cum_time, eta_min, model.ψ,
+            estimate_ψ ? "estimated" : "fixed", iter_cg_reltol)
+        println("="^90)
+        iter_fit = AiRemlFit(AI, AI_inv, se, score, initial_params, ai_params,
+            converged, iter, step_crit, α, settings, nothing)
+        _show_model(stdout, model, iter_fit; in_progress=true)
         flush(stdout)
 
         # CSV-logg (med flush for ekstern overvåking)
@@ -655,22 +718,27 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
                 @printf(io, "%d,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,",
                     iter, t_y, t_z, t_ai, t_iter, cum_time, eta_min)
                 for p in new_params; @printf(io, "%.6f,", p); end
+                !estimate_ψ && @printf(io, "%.6f,", model.ψ)
                 for s in se; @printf(io, "%.6f,", s); end
-                @printf(io, "%.6e,%.6e,%.4f,%.4f,%.1f,%s\n",
+                @printf(io, "%.6e,%.6e,%.6e,%.4f,%.1f,%s",
                     score_norm, step_crit, α, rho_ds, cond_G,
                     converged ? "true" : "false")
+                estimate_ψ && @printf(io, ",%.6e", psi_mcse)
+                println(io)
                 flush(io)
             end
         end
 
         if converged
-            println("\n\n✅ AI-REML har konvergert 😄.")
+            println("\n✅ AI-REML har konvergert 😄.")
             break
         end
-        alpha_next = adapt_damping(α, step_crit, previous_step_crit;
+        # Adapt from the attempted α, not the feasibility-halved one: a boundary-limited
+        # α≈1e-7 would otherwise become the next start, and from there the criterion can
+        # never improve 10% per iteration, so α would never recover. Re-halving is cheap.
+        alpha_next = adapt_damping(α_start, step_crit, previous_step_crit;
             enabled=adaptive_damping)
         previous_step_crit = step_crit
-        println()
         if iter == max_iter
             println("\n⚠️ Maks iterasjoner nådd uten full konvergens.")
         end

@@ -3,10 +3,6 @@ if !@isdefined(score_ai_dense_fixture)
 end
 using Test
 
-module DirectReturnContracts
-    include(joinpath(@__DIR__, "..", "emai_direct.jl"))
-end
-
 @testset "mutating return contracts" begin
     f = score_ai_dense_fixture()
     @testset "SGE peer=$peer" for peer in (false, true)
@@ -68,36 +64,4 @@ end
             comps, model, workspaces) === ai
     end
 
-    @testset "direct model" begin
-        D = DirectReturnContracts
-        model = D.DirectModel(f.y, f.X, f.Ainv, f.L_Ainv,
-            f.groups.obs_to_id, 1.2, 0.9)
-        @test D.update_params!(model, [0.2, -0.4], 0.5) === model
-        @test model.σ2_d ≈ 1.3
-        @test model.σ2_e ≈ 0.7
-        dim = length(model.sol_y)
-        rhs = zeros(dim)
-        @test D.build_rhs!(rhs, model, model.y) === rhs
-        @test D.build_rhs_threaded!(rhs, model, model.y) === rhs
-        W = hcat(f.X, f.Zd)
-        @test rhs ≈ W' * model.y
-        precond = D.get_diag_preconditioner(model)
-        push!(model.sol_z, zeros(dim))
-        for verbose in (false, true)
-            fill!(model.sol_y, 0.0)
-            fill!(model.sol_z[1], 0.0)
-            @test D.solve_mme_y!(model, precond; verbose, reltol=1e-12) === model
-            @test D.solve_mme_z!(model, model.y, 1, precond; verbose, reltol=1e-12) === model
-            @test model.sol_z[1] ≈ model.sol_y
-        end
-        dest = zeros(dim)
-        ws = D.create_thread_workspaces(model, 1)[1]
-        @test D.solve_mme_direct!(dest, model, model.y, precond; reltol=1e-12) === dest
-        @test D.solve_mme_direct_threaded!(dest, model, model.y, ws, precond; reltol=1e-12) === dest
-        @test D.solve_mme_z_threaded!(dest, model, model.y, ws, precond; reltol=1e-12) === dest
-        @test dest ≈ model.sol_y
-        out = zeros(size(model.Ainv, 1))
-        @test D.apply_A!(out, model, ones(length(out))) === out
-        @test D.apply_A_threaded!(out, model.L_Ainv, ones(length(out)), ws.tmp_N1) === out
-    end
 end

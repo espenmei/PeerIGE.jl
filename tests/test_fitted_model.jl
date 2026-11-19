@@ -3,6 +3,103 @@ if !@isdefined(score_ai_dense_fixture)
 end
 using Test
 
+@testset "fixed damping retries the requested starting step" begin
+    f = score_ai_dense_fixture()
+    make() = SGEModel(f.y, f.X, f.Ainv, f.L_Ainv, f.groups, 1.2, 0.2, 0.12, 0.9)
+    settings = (k=20, seed=3, damping=1.0, adaptive_damping=false,
+        cg_reltol=1e-10, cg_reltol_early=1e-10, ai_reltol=1e-10,
+        cg_maxiter=2000, ai_maxiter=2000, verbose_cg=false)
+    reference = make()
+    fit_aireml!(reference; settings..., max_iter=1)
+    first_alpha = reference.fit.alpha
+    @test 0 < first_alpha < settings.damping
+
+    # A fresh one-step fit starts from the requested damping, not the last safe step.
+    fit_aireml!(reference; settings..., max_iter=1, refit=true)
+    @test reference.fit.alpha > first_alpha
+    model = make()
+    fit_aireml!(model; settings..., max_iter=2)
+    @test model.fit.alpha == reference.fit.alpha
+    @test get_params(model) ≈ get_params(reference) rtol=1e-7 atol=1e-10
+end
+
+@testset "ψ is visible in every iteration and CSV log" begin
+    f = score_ai_dense_fixture()
+    for estimate_ψ in (false, true)
+        model = SGEModel(f.y, f.X, f.Ainv, f.L_Ainv, f.groups,
+            1.2, 0.2, 0.12, 0.9; ψ=0.5)
+        mktempdir() do dir
+            output_path = joinpath(dir, "output.txt")
+            log_path = joinpath(dir, "iterations.csv")
+            open(output_path, "w") do io
+                redirect_stdout(io) do
+                    fit_aireml!(model; max_iter=3, k=8, damping=0.1,
+                        adaptive_damping=false, verbose_cg=false,
+                        estimate_ψ=estimate_ψ, log_file=log_path)
+                end
+            end
+            output = read(output_path, String)
+            matches = collect(eachmatch(
+                r"ITERASJON\s+(\d+).*?\|\s+ψ=([0-9.eE+-]+)\s+\((fixed|estimated)\)", output))
+            log = DataFrame(CSV.File(log_path))
+            @test length(matches) == model.fit.n_iter == nrow(log)
+            @test :psi in propertynames(log)
+            @test (:se_psi in propertynames(log)) == estimate_ψ
+            @test (:psi_score_mcse in propertynames(log)) == estimate_ψ
+            for (i, m) in enumerate(matches)
+                @test parse(Int, m.captures[1]) == i
+                @test m.captures[3] == (estimate_ψ ? "estimated" : "fixed")
+                @test parse(Float64, m.captures[2]) ≈ log.psi[i] atol=5.1e-7
+            end
+            @test log.psi[end] ≈ model.ψ atol=5.1e-7
+            if estimate_ψ
+                @test any(abs.(log.psi .- 0.5) .> 1e-6)
+            else
+                @test all(log.psi .== 0.5)
+            end
+            @test occursin("$(model.ψ) ($(estimate_ψ ? "estimated" : "fixed"))",
+                sprint(show, MIME"text/plain"(), model))
+            result = snapshot(model; include_fixef_se=false)
+            @test occursin("$(model.ψ) ($(estimate_ψ ? "estimated" : "fixed"))",
+                sprint(show, MIME"text/plain"(), result))
+        end
+    end
+end
+
+@testset "household boundary allows a real fit to progress" begin
+    f = score_ai_dense_fixture()
+    y = randn(MersenneTwister(3), length(f.y))
+    model = SGEModel(y, f.X, f.Ainv, f.L_Ainv, f.groups,
+        0.77, 0.23, 0.089, 0.15; env_ids=f.env_ids,
+        σ2_env=[0.011, 1e-6], env_names=["group", "household"], ψ=1.0)
+    mktempdir() do dir
+        output_path = joinpath(dir, "output.txt")
+        log_path = joinpath(dir, "iterations.csv")
+        open(output_path, "w") do io
+            redirect_stdout(io) do
+                fit_aireml!(model; max_iter=3, k=32, damping=0.2,
+                    adaptive_damping=false, cg_reltol=1e-10, cg_reltol_early=1e-10,
+                    ai_reltol=1e-10, cg_maxiter=2000, ai_maxiter=2000,
+                    verbose_cg=false, log_file=log_path)
+            end
+        end
+        output = read(output_path, String)
+        log = DataFrame(CSV.File(log_path))
+        @test !model.peer_env
+        @test occursin("Fixed at lower bound this iteration: σ²_household", output)
+        @test occursin("Held near lower bound: σ²_household", output)
+        @test occursin(r"\n  σ²_group\s", output)
+        @test get_param_names(model)[5:6] == ["σ²_env1", "σ²_env2"]
+        @test _display_param_names(["σ²_d", "σ²_env1", "σ²_env2", "σ²_pe"], ["cohort"]) ==
+            ["σ²_d", "σ²_cohort", "σ²_env2", "σ²_pe"]
+        @test log.alpha[1] > 1e-3
+        @test log.s2env2[1] == 1e-6
+        @test abs(log.s2d[1] - 0.77) > 0.1
+        @test all(log.s2d .* log.s2s .> log.sds .^ 2)
+        @test all(log.s2env2 .>= 1e-6)
+    end
+end
+
 @testset "fitted model and independent inference snapshots" begin
     f = score_ai_dense_fixture()
     make(H=0, peer=false, psi=0.0) = SGEModel(f.y, f.X, f.Ainv, f.L_Ainv,
@@ -64,6 +161,11 @@ using Test
                 params_before = get_params(model)
                 model_display = sprint(show, MIME"text/plain"(), model)
                 @test occursin("AI-REML fit", model_display)
+                @test occursin("Iteration diagnostics", model_display)
+                @test occursin("max|Δ_AI|/SE=", model_display)
+                @test occursin("Sampling correlations", model_display)
+                @test occursin("Settings: k=5", model_display)
+                @test occursin("Iteration diagnostics", sprint(show, MIME"text/plain"(), snapshot(model; include_fixef_se=false)))
                 @test occursin("Variance components", model_display)
                 @test occursin("σ²_d", model_display)
                 @test occursin("(Intercept)", model_display)

@@ -16,6 +16,8 @@ LinearAlgebra.BLAS.set_num_threads(1)
 #   emai_precond.jl — diagonal and block preconditioners
 #   emai_mme.jl     — matrix-free mixed model equations, CG solves, V_i ops
 #   emai_aireml.jl  — trace probes, score/AI assembly, fitting and snapshots
+#   emai_show.jl    — model/result reports with per-iteration diagnostics
+#   emai_post.jl    — post-fit stochastic log-likelihood and ψ score test
 # The using/import statements above are shared by every included file.
 # =====================================================================
 
@@ -23,3 +25,5 @@ include(joinpath(@__DIR__, "emai_core.jl"))
 include(joinpath(@__DIR__, "emai_precond.jl"))
 include(joinpath(@__DIR__, "emai_mme.jl"))
 include(joinpath(@__DIR__, "emai_aireml.jl"))
+include(joinpath(@__DIR__, "emai_show.jl"))
+include(joinpath(@__DIR__, "emai_post.jl"))

@@ -628,7 +628,8 @@ function fit_aireml!(model::SGEModel; max_iter=15, k=5, damping=0.2,
         AI_reg = AI + 1e-6 * I
         delta, boundary_active = _boundary_constrained_delta(model, AI_reg, score)
         if !isempty(boundary_active)
-            names = get_param_names(model; include_ψ=estimate_ψ)
+            names = _display_param_names(get_param_names(model; include_ψ=estimate_ψ),
+                model.env_names)
             println("    Fixed at lower bound this iteration: ",
                 join(names[boundary_active], ", "))
         end

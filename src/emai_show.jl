@@ -11,9 +11,22 @@ function _g_health(σ2_d, σ2_s, σ_ds)
     return rho_ds, cond_G, eig_G
 end
 
+# Display-only labels: internal names ("σ²_env$h") stay unchanged because the CSV
+# log, saved results and post-fit comparison use them as keys.
+function _display_param_names(param_names, env_names)
+    return map(param_names) do p
+        m = match(r"^σ²_env(\d+)$", p)
+        m === nothing && return p
+        h = parse(Int, m.captures[1])
+        return h <= length(env_names) ? "σ²_" * env_names[h] : p
+    end
+end
+
 function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_se,
     param_names, params, fit; env_names=String[], env_levels=Int[], peer_env=false,
     ψ=0.0, in_progress=false)
+    labels = _display_param_names(param_names, env_names)
+    w = max(10, maximum(textwidth, labels))
     println(io, in_progress ? "AI-REML iteration $(fit.n_iter)" : "AI-REML fit")
     status = fit === nothing ? "not fitted" :
         fit.converged ? "converged after $(fit.n_iter) iteration(s)" :
@@ -47,15 +60,15 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
     z = abs.(delta) ./ max.(se, eps())
     println(io)
     println(io, "Variance components")
-    @printf(io, "  %-10s %12s %12s %12s %12s %10s %12s\n",
-        "Component", "Estimate", "SE", "Score", "Δ_AI", "|Δ|/SE", "Start")
+    @printf(io, "  %s %12s %12s %12s %12s %10s %12s\n",
+        rpad("Component", w), "Estimate", "SE", "Score", "Δ_AI", "|Δ|/SE", "Start")
     for i in eachindex(param_names)
-        @printf(io, "  %-10s %12.6g %12.6g %+12.4g %+12.4g %10.3g %12.6g%s\n",
-            param_names[i], params[i], se[i], score[i], delta[i], z[i],
+        @printf(io, "  %s %12.6g %12.6g %+12.4g %+12.4g %10.3g %12.6g%s\n",
+            rpad(labels[i], w), params[i], se[i], score[i], delta[i], z[i],
             fit.initial_params[i], z[i] == maximum(z) && !fit.converged ? "  ◀" : "")
     end
     if !isempty(boundary_active)
-        println(io, "  Held near lower bound: ", join(param_names[boundary_active], ", "),
+        println(io, "  Held near lower bound: ", join(labels[boundary_active], ", "),
             "; Δ_AI uses the reduced AI system.")
     end
 
@@ -77,7 +90,7 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
     println(io)
     println(io, "Iteration diagnostics")
     @printf(io, "  Criterion:  max|Δ_AI|/SE=%.3e (%s); converged when < 0.01\n",
-        fit.step_crit, param_names[argmax(z)])
+        fit.step_crit, labels[argmax(z)])
     @printf(io, "  Steps:      last α=%.3e; last relative change=%.3e; relative change from start=%.3e\n",
         fit.alpha, norm(params .- fit.ai_params) / norm(fit.ai_params),
         norm(params .- fit.initial_params) / norm(fit.initial_params))
@@ -101,7 +114,7 @@ function _show_aireml_report(io::IO, n_obs, n_pedigree, fixef_names, beta, beta_
     # Sampling correlations from AI⁻¹; |r| > 0.9 means the components are hard to separate.
     d = sqrt.(abs.(diag(fit.vcov)))
     R = fit.vcov ./ (d * d')
-    short = [first(name, 8) for name in param_names]
+    short = [first(name, 8) for name in labels]
     println(io, "  Sampling correlations of estimates (AI⁻¹; ! marks |r| > 0.9):")
     println(io, "    ", rpad("", 9), join(lpad.(short[1:end-1], 9)))
     for i in 2:length(param_names)

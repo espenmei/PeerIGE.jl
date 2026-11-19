@@ -86,8 +86,12 @@ end
         output = read(output_path, String)
         log = DataFrame(CSV.File(log_path))
         @test !model.peer_env
-        @test occursin("Fixed at lower bound this iteration: σ²_env2", output)
-        @test occursin("Held near lower bound: σ²_env2", output)
+        @test occursin("Fixed at lower bound this iteration: σ²_household", output)
+        @test occursin("Held near lower bound: σ²_household", output)
+        @test occursin(r"\n  σ²_group\s", output)
+        @test get_param_names(model)[5:6] == ["σ²_env1", "σ²_env2"]
+        @test _display_param_names(["σ²_d", "σ²_env1", "σ²_env2", "σ²_pe"], ["cohort"]) ==
+            ["σ²_d", "σ²_cohort", "σ²_env2", "σ²_pe"]
         @test log.alpha[1] > 1e-3
         @test log.s2env2[1] == 1e-6
         @test abs(log.s2d[1] - 0.77) > 0.1
